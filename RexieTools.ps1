@@ -4,14 +4,15 @@
 .DESCRIPTION
     Presents a menu of common remote administration tasks (WinRM-based). Stores a universal
     credential (optional) in the user's Documents folder and re-uses it across tasks.
-$11.0.2
+.VERSION
+    1.0.2
 .AUTHOR
     c0ryS (Cory Smith)
 .LAST UPDATED
-    2025-09-10
+    2026-02-26
 .REQUIREMENTS
     • PowerShell 7+
-    • Network access to \\vscifs1 for version check
+    • Internet access for GitHub version check (if unavailable, script still runs)
     • WinRM enabled on target Windows devices
 .NOTES
     Universal credential path: ~/Documents/UniversalCredential.xml
@@ -210,13 +211,18 @@ function Start-HostnameReservationApiRemote {
 }
 
 # Define the current version of this script
-$currentVersion = [version]"1.0.0"
+$currentVersion = [version]"1.0.2"
 
 # TODO: Break repeated code blocks into reusable functions for maintainability.
 
-#region Version Check & Banner
-# Define the remote version file path
-$remoteVersionFile = "\\vscifs1\eusfiles\Corys Home\Version Checker\Rexie Tools\version.txt"
+#region Version Check & Banner (GitHub)
+# GitHub-based version check (personal repo)
+$GitHubOwner  = "c0ry-s"
+$GitHubRepo   = "rexie-tools"
+$GitHubBranch = "main"
+
+$versionUrl = "https://raw.githubusercontent.com/$GitHubOwner/$GitHubRepo/$GitHubBranch/version.txt"
+
 Write-Status -Level INFO -Message "-=*Rexie Tools by c0ryS*=-"
 Write-Host @"
             __
@@ -225,29 +231,28 @@ Write-Host @"
  __/       /  
 <__.|_|-|_|   
 "@ -ForegroundColor Blue
-# Check if the remote version file exists and compare versions
+
 try {
-    if (Test-Path $remoteVersionFile) {
-        $latestVersionString = Get-Content $remoteVersionFile -ErrorAction Stop | Select-Object -First 1
-        if ($null -eq $latestVersionString -or $latestVersionString.Trim() -eq "") {
-            Write-Status -Level WARN -Message "Remote version file is empty. Skipping version check."
-        } else {
-            $latestVersion = [version]($latestVersionString.Trim())
-            Write-Status -Level INFO -Message "Current version: $currentVersion. Latest: $latestVersion."
-            if ($latestVersion -gt $currentVersion) {
-                Write-Status -Level WARN -Message "Update available ($latestVersion). Pull the latest file from \\vscifs1\\eusfiles\\Corys Home."
-                return
-            } else {
-                Write-Status -Level OK -Message "Script is up to date."
-            }
-        }
+    $latestVersionString = (Invoke-RestMethod -Uri $versionUrl -Method Get -TimeoutSec 5 -ErrorAction Stop).ToString().Trim()
+
+    if ([string]::IsNullOrWhiteSpace($latestVersionString)) {
+        Write-Status -Level WARN -Message "GitHub version file is empty. Skipping version check."
     } else {
-        Write-Status -Level WARN -Message "Remote version file not found at $remoteVersionFile. Skipping version check."
+        $latestVersion = [version]$latestVersionString
+        Write-Status -Level INFO -Message "Current version: $currentVersion. Latest: $latestVersion."
+
+        if ($latestVersion -gt $currentVersion) {
+            $releaseUrl = "https://github.com/$GitHubOwner/$GitHubRepo/releases/latest"
+            Write-Status -Level WARN -Message "Update available ($latestVersion). Download latest from: $releaseUrl"
+        } else {
+            Write-Status -Level OK -Message "Script is up to date."
+        }
     }
-} catch {
-    Write-Status -Level WARN -Message "Version check error: $($_.Exception.Message)"
 }
-#endregion Version Check & Banner
+catch {
+    Write-Status -Level WARN -Message "GitHub version check failed: $($_.Exception.Message)"
+}
+#endregion Version Check & Banner (GitHub)
  #region Session Loop & Credential Handling
 $repeatSession = $true
 do {
