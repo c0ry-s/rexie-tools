@@ -2,3 +2,9 @@
 .vscode/
 *.log
 *.tmp
+
+# Build artifacts
+*.exe
+
+# Build artifacts
+*.exe
