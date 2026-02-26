@@ -4,8 +4,7 @@
 .DESCRIPTION
     Presents a menu of common remote administration tasks (WinRM-based). Stores a universal
     credential (optional) in the user's Documents folder and re-uses it across tasks.
-.VERSION
-    1.0.0
+$11.0.2
 .AUTHOR
     c0ryS (Cory Smith)
 .LAST UPDATED
