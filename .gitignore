@@ -1,10 +1,11 @@
+# macOS
 .DS_Store
-.vscode/
-*.log
+
+# Logs / artifacts
+logs/
+builds/
+*.zip
+*.exe
+
+# Temp
 *.tmp
-
-# Build artifacts
-*.exe
-
-# Build artifacts
-*.exe
