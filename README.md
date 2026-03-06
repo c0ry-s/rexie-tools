@@ -1,61 +1,174 @@
 # Rexie Tools
 
+```
+            __
+           / _) 
+    .-^^^-/ / 
+ __/       /  
+<__.|_|-|_|   
+```
+
 PowerShell automation toolkit for endpoint support workflows.
 
----
+Rexie Tools is a macOS-hosted PowerShell remote administration launcher designed for endpoint support engineers. It provides a fast menu-driven interface for running diagnostics and remediation tasks on remote Windows devices using WinRM.
 
-## Features
+⸻
 
-- OS-aware credential storage (Windows + macOS)
-- GitHub version checking
-- Windows standalone EXE build
-- macOS portable launcher
+Project Status
 
----
+Version: 1.2.0
 
-## Installation
+PowerShell | macOS Host | Windows Endpoint Automation
 
-### Windows
+⸻
 
-1. Go to the **Releases** page.
-2. Download the latest `RexieTools.exe`.
-3. Run the executable.
+Features
+
+Remote Administration Toolkit
+
+Menu-driven automation for common endpoint support tasks.
+
+1. Group Policy (GPO)
+• gpupdate /force
+• certificate auto-enrollment
+• Skynet fix workflow
+• certificate request tools
+
+2. Event Log Scan
+• scans System and Application logs
+• groups errors and warnings for quick troubleshooting
+
+3. Computer Information
+
+Displays detailed hardware and system data:
+
+• model and serial number
+• OS version and build
+• RAM usage
+• CPU speed
+• system uptime
+• dock detection
+• monitor detection
+• network connection type
+• logged-in user
+
+4. Dell Command Update
+
+• runs Dell Command Update remotely
+• streams update progress to console
+
+5. Scheduled Reboot
+
+• reboot immediately
+• schedule a one-time reboot using scheduled tasks
+
+6. Hostname Reservation Assistant
+
+• integrates with Rex hostname reservation API
+• determines next available device number automatically
+• includes self-heal logic if the API service is offline
+
+7. Login Shark
+
+Session intelligence tool used to determine reboot safety.
+
+Displays:
+
+• active user session
+• last logged-on user
+• recent authentication events
+• lock/unlock status
+• reboot safety recommendation
+
+8. SCCM / Software Center Actions
+
+Remotely trigger Configuration Manager client cycles:
+
+• Machine Policy Retrieval
+• User Policy Retrieval
+• Application Deployment Evaluation
+• Software Update Evaluation
+• Hardware Inventory
+• Full Client Check-In
+
+9. Battery Report
+
+• generates battery health report on remote laptops
+• opens report via SMB from the admin share
+
+⸻
+
+Architecture
+
+Operator System
+macOS with PowerShell 7+
+
+Target Systems
+Windows endpoints with WinRM enabled
+
+All tasks are executed using PowerShell remoting (WinRM).
+
+⸻
+
+Installation
+
+Windows
+	1.	Go to the Releases section of this repository
+	2.	Download RexieTools.exe
+	3.	Run the executable
 
 No installation required.
 
----
+⸻
 
-### macOS
+macOS
 
-1. Install PowerShell 7.
-2. Download the repository.
-3. Run:
+Install PowerShell:
+
+brew install –cask powershell
+
+Clone the repository:
+
+git clone https://github.com/c0ry-s/rexie-tools.git
+
+Run Rexie Tools:
 
 ./run_rexietools.command
 
----
+⸻
 
-## Versioning
+Credential Storage
 
-Releases follow semantic versioning:
+Rexie Tools supports persistent credential storage.
 
-vMajor.Minor.Patch
+Credentials are stored locally using encrypted PowerShell credential objects.
 
-The application checks GitHub for newer versions and will notify users when updates are available.
+Location:
 
----
+~/Documents/UniversalCredential.xml
 
-## Security
-
-Credentials are stored locally using OS-native secure mechanisms:
-
-- Windows: Secure credential storage
-- macOS: Local encrypted credential storage
+These credentials are used for WinRM connections to remote Windows devices.
 
 No credentials are stored in this repository.
 
----
+⸻
 
-## License
+Versioning
+
+Rexie Tools follows semantic versioning.
+
+Format:
+
+Major.Minor.Patch
+
+Example:
+
+1.2.0
+
+The script checks GitHub automatically and will notify users when a newer version is available.
+
+⸻
+
+License
 
 Internal use and distribution permitted.
