@@ -1,17 +1,18 @@
-<#!
+<#
 .SYNOPSIS
     Rexie Tools – Mac-hosted PowerShell remote admin launcher for UNC Health.
 .DESCRIPTION
     Presents a menu of common remote administration tasks (WinRM-based). Stores a universal
     credential (optional) in the user's Documents folder and re-uses it across tasks.
-$11.0.2
+.VERSION
+    1.0.2
 .AUTHOR
     c0ryS (Cory Smith)
 .LAST UPDATED
-    2025-09-10
+    2026-02-26
 .REQUIREMENTS
     • PowerShell 7+
-    • Network access to \\vscifs1 for version check
+    • Internet access for GitHub version check (if unavailable, script still runs)
     • WinRM enabled on target Windows devices
 .NOTES
     Universal credential path: ~/Documents/UniversalCredential.xml
@@ -44,6 +45,7 @@ function Invoke-IfShouldProcess {
 # --- Standardized Console Output ---------------------------------------------
 # Levels: INFO, OK, WARN, ERROR, DEBUG
 # ---------------------------------------------------------------------------
+
 function Write-Status {
     [CmdletBinding()]
     param(
@@ -76,76 +78,374 @@ function Write-Status {
     }
 }
 
-# --- Rexie Robo (Audiology Deploy) --------------------------------------------
-# Copies \\vscifs1\eusfiles\Installs\Audiology
-# To C:\HCSTools\Audiology on a target device using Scheduled Task
+# --- Core Helpers -------------------------------------------------------------
+# Shared helpers for credentials, hostname prompting, WinRM validation, and
+# remote execution. Several menu options depend on these.
+# -----------------------------------------------------------------------------
+function Pause-Rexie {
+    [CmdletBinding()]
+    param([string]$Message = "Press Enter to continue")
+    Read-Host $Message | Out-Null
+}
+
+function Get-RexieCredential {
+    [CmdletBinding()]
+    param([string]$CredPath)
+
+    if (Test-Path $CredPath) {
+        try { return Import-Clixml -Path $CredPath }
+        catch {
+            Write-Status -Level WARN -Message "Stored credential exists but could not be read. Prompting for credentials."
+        }
+    }
+
+    Write-Status -Level WARN -Message "No stored credentials found."
+    $cred = Get-Credential -Message "Enter credentials for remote access"
+
+    $storeAnswer = Read-Host "Do you want to store these credentials for future use? (Y/N)"
+    if ($storeAnswer.ToUpper().StartsWith("Y")) {
+        try {
+            $cred | Export-Clixml -Path $CredPath
+            Write-Status -Level OK -Message "Credentials stored at $CredPath"
+        } catch {
+            Write-Status -Level WARN -Message "Failed to store credentials: $($_.Exception.Message)"
+        }
+    }
+    return $cred
+}
+
+function Read-RexieHostname {
+    [CmdletBinding()]
+    param(
+        [string]$CurrentHostname,
+        [string]$Prompt = "Enter the hostname or IP address of the Windows PC",
+        [switch]$ForceNew
+    )
+
+    if (-not $ForceNew -and -not [string]::IsNullOrWhiteSpace($CurrentHostname)) {
+        $reuse = Read-Host "Reuse current hostname '$CurrentHostname'? (Y/N) [Default: Y]"
+        if ([string]::IsNullOrWhiteSpace($reuse) -or $reuse.ToUpper().StartsWith("Y")) {
+            return $CurrentHostname
+        }
+    }
+
+    while ($true) {
+        $h = Read-Host $Prompt
+        if ([string]::IsNullOrWhiteSpace($h)) {
+            Write-Host "Hostname cannot be empty." -ForegroundColor Red
+            continue
+        }
+
+        $pingSuccess = Test-Connection -ComputerName $h -Count 1 -Quiet
+        if ($pingSuccess) { return $h }
+
+        Write-Host "Device $h is not reachable via ping." -ForegroundColor Yellow
+        Write-Host "`nWhat would you like to do?"
+        Write-Host "1. Try the same hostname again"
+        Write-Host "2. Enter a different hostname"
+        Write-Host "3. Return to main menu"
+        $choice = Read-Host "Select an option (1-3)"
+        switch ($choice) {
+            '1' { continue }
+            '2' { continue }
+            '3' { return $null }
+            default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; return $null }
+        }
+    }
+}
+
+function Test-RexieWinRM {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Hostname,
+        [Parameter(Mandatory)] [pscredential]$Credential,
+        [int]$MaxAttempts = 3
+    )
+
+    $attempt = 0
+    while ($attempt -lt $MaxAttempts) {
+        try {
+            Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock { Test-WSMan } -ErrorAction Stop | Out-Null
+            return $true
+        } catch {
+            Write-Status -Level ERROR -Message "WinRM connection failed to ${Hostname}: $($_.Exception.Message)"
+            $Credential = Get-Credential -Message "Enter credentials for remote access"
+            $script:Cred = $Credential
+            $attempt++
+        }
+    }
+    return $false
+}
+
+function Invoke-RexieRemote {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Hostname,
+        [Parameter(Mandatory)] [pscredential]$Credential,
+        [Parameter(Mandatory)] [scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList
+    )
+
+    Write-Status -Level INFO -Message "Selected remote target: $Hostname"
+
+    if (-not (Test-Connection -ComputerName $Hostname -Count 2 -Quiet)) {
+        Write-Status -Level ERROR -Message "Host $Hostname is offline or unreachable."
+        return $null
+    }
+
+    if (-not (Test-RexieWinRM -Hostname $Hostname -Credential $Credential)) {
+        Write-Status -Level ERROR -Message "Maximum WinRM connection attempts reached. Returning to menu."
+        return $null
+    }
+
+    try {
+        if ($ArgumentList) {
+            return Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -ErrorAction Stop
+        } else {
+            return Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock $ScriptBlock -ErrorAction Stop
+        }
+    } catch {
+        Write-Status -Level ERROR -Message "Remote command failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# --- ASCII Splash: Login Shark -------------------------------------------------
+function Show-LoginSharkSplash {
+    [CmdletBinding()]
+    param()
+
+    Clear-Host
+    Write-Host @"
+
+                            ,_.
+                           ./  |                                          _-
+                         ./    |                                       _-'/
+      ______.,         ./      /                                     .'  (
+ _---'___._.  '----___/       (                                    ./  /`'
+(,----,_  O \                  \_.                               ./   :
+ \___   "--_                      "--._,                       ./    /
+ /^^^^^-__          ,,,,,               "-._       /|         /     /
+ `,       -        /////                    "`--__/ (_,    ,_/    ./
+   "-_,           ''''' __,                            `--'      /
+       "-_,             \\ `-_                                  (
+           "-_.          \\   \.                                 \_
+          /    "--__,      \\   \.                       ____.     "-._,
+         /        ./ `---____\\   \.______________,---\ (     \,        "-.,
+        |       ./             \\   \        /\  |     \|       `--______---`
+        |     ./                 \\  \      /_/\_!
+        |   ./                     \\ \
+        |  /     *:Login SHARK:*     \_\
+        |_/
+"@ -ForegroundColor Cyan
+}
+
+
+# --- Login Shark (Session Intelligence) ---------------------------------------
+# Shows active session info, last logged-on user, recent interactive auth events,
+# lock state, and a reboot / remote login recommendation.
 # -------------------------------------------------------------------------------
-function Rexie-Robo {
+function Rexie-LoginShark {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string]$Hostname,
         [Parameter(Mandatory)] [pscredential]$Credential
     )
 
-    $source = '\\vscifs1\eusfiles\Installs\Audiology'
-    $dest   = 'C:\HCSTools\Audiology'
+    Write-Status -Level INFO -Message "Login Shark scanning $Hostname ..."
 
-    Write-Status -Level INFO -Message "Starting Rexie Robo (Scheduled Task mode) on $Hostname"
-    Write-Status -Level INFO -Message "Source: $source"
-    Write-Status -Level INFO -Message "Destination: $dest"
+    # 1) Active sessions (LOGON TIME / IDLE TIME)
+    $quserOut = $null
+    try {
+        $quserOut = Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock { quser } -ErrorAction Stop
+    } catch {
+        $quserOut = $null
+    }
 
-    # Use same credential for WinRM and scheduled task run-as
-    $runUser = $Credential.UserName
-    $runPass = $Credential.GetNetworkCredential().Password
+    # 2) Last logged-on user (registry)
+    $lastLoggedOn = $null
+    try {
+        $lastLoggedOn = Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock {
+            (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI" -ErrorAction SilentlyContinue).LastLoggedOnUser
+        } -ErrorAction Stop
+    } catch {
+        $lastLoggedOn = $null
+    }
+
+    # 3) Current interactive user (best-effort): owner of explorer.exe
+    $interactiveUser = $null
+    try {
+        $interactiveUser = Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock {
+            try {
+                $p = Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($p) {
+                    $o = $p.GetOwner()
+                    if ($o -and $o.User) { return $o.User }
+                }
+            } catch { }
+            return $null
+        } -ErrorAction Stop
+    } catch {
+        $interactiveUser = $null
+    }
+
+    # 4) Recent auth events (Security log): last interactive logon + last lock/unlock
+    $lastInteractiveLogon = $null
+    $lastLockEvent        = $null
+    $lastUnlockEvent      = $null
 
     try {
-        $result = Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock {
-            param($runUser, $runPass, $src, $dst)
-
-            New-Item -ItemType Directory -Path $dst -Force | Out-Null
-
-            $ts  = Get-Date -Format 'yyyyMMdd-HHmmss'
-            $logDir = 'C:\HCSTools\Logs\RexieRobo'
-            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-            $log = Join-Path $logDir "audiology-$ts.log"
-
-            $task = "Rexie-Robo-$ts"
-            $cmdFile = Join-Path $logDir "RexieRobo-$ts.cmd"
-
-            $cmdContent = @"
-@echo off
- echo ==== Rexie Robo Start %date% %time% ====>>"$log"
- echo Host: %COMPUTERNAME%   User: %USERNAME%>>"$log"
- echo Source: $src>>"$log"
- echo Dest:   $dst>>"$log"
- echo.>>"$log"
- robocopy "$src" "$dst" *.* /E /ZB /R:5 /W:5 /COPY:DAT /DCOPY:DAT /V /FP /TS /ETA /BYTES /NP /UNILOG+:"$log" /TEE
- echo.>>"$log"
- echo ==== Rexie Robo End %date% %time%  RC=%errorlevel% ====>>"$log"
-"@
-
-            Set-Content -Path $cmdFile -Value $cmdContent -Encoding ASCII
-
-            schtasks /Delete /TN $task /F *> $null 2>&1
-
-            schtasks /Create /TN $task /SC ONCE /ST 23:59 /RL HIGHEST `
-                /RU $runUser /RP $runPass `
-                /TR "cmd.exe /c `"$cmdFile`"" /F | Out-Null
-
-            schtasks /Run /TN $task | Out-Null
-
-            [pscustomobject]@{
-                TaskName = $task
-                Log      = $log
+        $auth = Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock {
+            $out = [ordered]@{
+                LastInteractiveLogon = $null
+                LastLock             = $null
+                LastUnlock           = $null
             }
-        } -ArgumentList $runUser, $runPass, $source, $dest
 
-        Write-Status -Level OK -Message "Scheduled Task Created: $($result.TaskName)"
-        Write-Status -Level INFO -Message "Log Path: $($result.Log)"
+            try {
+                $ev = Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4624; StartTime=(Get-Date).AddDays(-2) } -MaxEvents 200 -ErrorAction Stop
+                foreach ($e in $ev) {
+                    $user = $e.Properties[5].Value
+                    $dom  = $e.Properties[6].Value
+                    $lt   = [int]$e.Properties[8].Value
+
+                    if ([string]::IsNullOrWhiteSpace($user)) { continue }
+                    if ($user -match '\$$') { continue }
+                    if ($user -in @('SYSTEM','LOCAL SERVICE','NETWORK SERVICE','ANONYMOUS LOGON')) { continue }
+                    if ($lt -notin 2,7,11) { continue }
+
+                    $out.LastInteractiveLogon = [pscustomobject]@{
+                        Time      = $e.TimeCreated
+                        User      = if ($dom) { "$dom\$user" } else { $user }
+                        LogonType = $lt
+                    }
+                    break
+                }
+            } catch { }
+
+            try {
+                $lu = Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4800,4801; StartTime=(Get-Date).AddDays(-2) } -MaxEvents 50 -ErrorAction Stop
+                foreach ($e in $lu) {
+                    if ($e.Id -eq 4800 -and -not $out.LastLock) {
+                        $out.LastLock = [pscustomobject]@{ Time = $e.TimeCreated }
+                    }
+                    if ($e.Id -eq 4801 -and -not $out.LastUnlock) {
+                        $out.LastUnlock = [pscustomobject]@{ Time = $e.TimeCreated }
+                    }
+                    if ($out.LastLock -and $out.LastUnlock) { break }
+                }
+            } catch { }
+
+            return [pscustomobject]$out
+        } -ErrorAction Stop
+
+        $lastInteractiveLogon = $auth.LastInteractiveLogon
+        $lastLockEvent        = $auth.LastLock
+        $lastUnlockEvent      = $auth.LastUnlock
+    } catch {
+        $lastInteractiveLogon = $null
+        $lastLockEvent        = $null
+        $lastUnlockEvent      = $null
     }
-    catch {
-        Write-Status -Level ERROR -Message "Rexie Robo failed: $($_.Exception.Message)"
+
+    # Parse quser output to detect active interactive session
+    $hasInteractiveUser = $false
+    $activeUser = $null
+    if ($quserOut) {
+        $activeSessionLines = $quserOut | Select-Object -Skip 1 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        foreach ($line in $activeSessionLines) {
+            if ($line -match '\s+Active\s+') {
+                $hasInteractiveUser = $true
+                $tokens = ($line -split '\s+') | Where-Object { $_ -ne '' }
+                if ($tokens -and $tokens.Count -gt 0) { $activeUser = $tokens[0] }
+                break
+            }
+        }
     }
+
+    # Best-effort lock state
+    $lockState = 'Unknown'
+    if ($lastLockEvent -and $lastUnlockEvent) {
+        $lockState = if ($lastLockEvent.Time -gt $lastUnlockEvent.Time) { 'Locked' } else { 'Unlocked' }
+    } elseif ($lastLockEvent -and -not $lastUnlockEvent) {
+        $lockState = 'Locked (no unlock seen)'
+    } elseif ($lastUnlockEvent -and -not $lastLockEvent) {
+        $lockState = 'Unlocked (no lock seen)'
+    }
+
+    Clear-Host
+    Write-Host "=================================================" -ForegroundColor Cyan
+    Write-Host "              Rexie Tools - Login Shark" -ForegroundColor Cyan
+    Write-Host "=================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Hostname: $Hostname"
+    Write-Host "Status:   Online (WinRM reachable)"
+    if ($interactiveUser) { Write-Host ("User:     {0}" -f $interactiveUser) }
+    if ($lockState)       { Write-Host ("Lock:     {0}" -f $lockState) }
+    Write-Host ""
+
+    Write-Host "-------------------------------------------------"
+    Write-Host "Active Session (quser)"
+    Write-Host "-------------------------------------------------"
+    if ($quserOut) {
+        $quserOut | ForEach-Object { Write-Host $_ }
+    } else {
+        Write-Host "Unavailable (quser failed)."
+    }
+
+    Write-Host ""
+    Write-Host "-------------------------------------------------"
+    Write-Host "Last Logged-On User"
+    Write-Host "-------------------------------------------------"
+    if ($lastLoggedOn) {
+        Write-Host $lastLoggedOn
+    } else {
+        Write-Host "Unavailable"
+    }
+
+    Write-Host ""
+    Write-Host "-------------------------------------------------"
+    Write-Host "Recent Authentication (best-effort)"
+    Write-Host "-------------------------------------------------"
+    if ($lastInteractiveLogon) {
+        Write-Host ("Last interactive logon: {0}  ({1})" -f $lastInteractiveLogon.Time, $lastInteractiveLogon.User)
+        Write-Host ("LogonType: {0}" -f $lastInteractiveLogon.LogonType)
+    } else {
+        Write-Host "Last interactive logon: Unavailable (no access or not found in last 48h)"
+    }
+
+    if ($lastLockEvent)   { Write-Host ("Last lock:   {0}" -f $lastLockEvent.Time) }
+    else                  { Write-Host "Last lock:   Unavailable" }
+
+    if ($lastUnlockEvent) { Write-Host ("Last unlock: {0}" -f $lastUnlockEvent.Time) }
+    else                  { Write-Host "Last unlock: Unavailable" }
+
+    Write-Host ""
+    Write-Host "-------------------------------------------------"
+    Write-Host "System Recommendation"
+    Write-Host "-------------------------------------------------"
+    if ($hasInteractiveUser) {
+        Write-Host "⚠ User session active" -ForegroundColor Yellow
+        if ($activeUser) { Write-Host ("User: {0}" -f $activeUser) -ForegroundColor Yellow }
+
+        if ($lockState -like 'Locked*') {
+            Write-Host "Session appears LOCKED. Reboot is still risky, but less disruptive than an active unlocked session." -ForegroundColor Yellow
+        }
+
+        Write-Host "Not safe for reboot" -ForegroundColor Yellow
+        Write-Host "Remote login possible (may interrupt user)" -ForegroundColor Yellow
+    } else {
+        if ($lockState -like 'Locked*' -or $lockState -like 'Unlocked*') {
+            Write-Host "⚠ No ACTIVE quser session detected, but lock/unlock evidence suggests a user was recently present." -ForegroundColor Yellow
+            Write-Host "Reboot is probably safe, but proceed with caution." -ForegroundColor Yellow
+        } else {
+            Write-Host "✓ Safe for reboot" -ForegroundColor Green
+            Write-Host "✓ Safe for remote login" -ForegroundColor Green
+        }
+    }
+
+    Write-Host ""
+    Read-Host "Press Enter to return to Rexie Tools" | Out-Null
 }
 
 # --- Hostname Reservation API Self-Heal Helpers --------------------------------
@@ -210,13 +510,18 @@ function Start-HostnameReservationApiRemote {
 }
 
 # Define the current version of this script
-$currentVersion = [version]"1.0.0"
+$currentVersion = [version]"1.0.2"
 
 # TODO: Break repeated code blocks into reusable functions for maintainability.
 
-#region Version Check & Banner
-# Define the remote version file path
-$remoteVersionFile = "\\vscifs1\eusfiles\Corys Home\Version Checker\Rexie Tools\version.txt"
+#region Version Check & Banner (GitHub)
+# GitHub-based version check (personal repo)
+$GitHubOwner  = "c0ry-s"
+$GitHubRepo   = "rexie-tools"
+$GitHubBranch = "main"
+
+$versionUrl = "https://raw.githubusercontent.com/$GitHubOwner/$GitHubRepo/$GitHubBranch/version.txt"
+
 Write-Status -Level INFO -Message "-=*Rexie Tools by c0ryS*=-"
 Write-Host @"
             __
@@ -225,29 +530,28 @@ Write-Host @"
  __/       /  
 <__.|_|-|_|   
 "@ -ForegroundColor Blue
-# Check if the remote version file exists and compare versions
+
 try {
-    if (Test-Path $remoteVersionFile) {
-        $latestVersionString = Get-Content $remoteVersionFile -ErrorAction Stop | Select-Object -First 1
-        if ($null -eq $latestVersionString -or $latestVersionString.Trim() -eq "") {
-            Write-Status -Level WARN -Message "Remote version file is empty. Skipping version check."
-        } else {
-            $latestVersion = [version]($latestVersionString.Trim())
-            Write-Status -Level INFO -Message "Current version: $currentVersion. Latest: $latestVersion."
-            if ($latestVersion -gt $currentVersion) {
-                Write-Status -Level WARN -Message "Update available ($latestVersion). Pull the latest file from \\vscifs1\\eusfiles\\Corys Home."
-                return
-            } else {
-                Write-Status -Level OK -Message "Script is up to date."
-            }
-        }
+    $latestVersionString = (Invoke-RestMethod -Uri $versionUrl -Method Get -TimeoutSec 5 -ErrorAction Stop).ToString().Trim()
+
+    if ([string]::IsNullOrWhiteSpace($latestVersionString)) {
+        Write-Status -Level WARN -Message "GitHub version file is empty. Skipping version check."
     } else {
-        Write-Status -Level WARN -Message "Remote version file not found at $remoteVersionFile. Skipping version check."
+        $latestVersion = [version]$latestVersionString
+        Write-Status -Level INFO -Message "Current version: $currentVersion. Latest: $latestVersion."
+
+        if ($latestVersion -gt $currentVersion) {
+            $releaseUrl = "https://github.com/$GitHubOwner/$GitHubRepo/releases/latest"
+            Write-Status -Level WARN -Message "Update available ($latestVersion). Download latest from: $releaseUrl"
+        } else {
+            Write-Status -Level OK -Message "Script is up to date."
+        }
     }
-} catch {
-    Write-Status -Level WARN -Message "Version check error: $($_.Exception.Message)"
 }
-#endregion Version Check & Banner
+catch {
+    Write-Status -Level WARN -Message "GitHub version check failed: $($_.Exception.Message)"
+}
+#endregion Version Check & Banner (GitHub)
  #region Session Loop & Credential Handling
 $repeatSession = $true
 do {
@@ -278,16 +582,15 @@ $cred = $Cred
 # --- Main Menu ---------------------------------------------------------------
     Write-Status -Level INFO -Message "Select an option:"
     Write-Host "1. Group Policy (GPO)"
-    Write-Host "2. View Installed and Failed Windows Updates"
+    Write-Host "2. Event Log Scan"
     Write-Host "3. View Computer Info"
     Write-Host "4. Run Dell Command Update"
     Write-Host "5. Schedule One-Time Reboot"
     Write-Host "6. Hostname Reservation Assistant"
-    Write-Host "7. Scan Event Logs (System & Application)"
-    Write-Host "8. Update Tidepool Uploader"
+    Write-Host "7. Login Shark"
+    Write-Host "8. SCCM / Software Center Actions"
     Write-Host "9. Battery Report"
-    Write-Host "10. Rexie Robo (Audiology Deploy)"
-    $selection = Read-Host "Enter your choice (1-10, Q to exit)"
+    $selection = Read-Host "Enter your choice (1-9, Q to exit)"
 
     if ($selection -match '^[Qq]$') {
         break
@@ -296,145 +599,10 @@ $cred = $Cred
     }
 
     switch ($selection) {
-        # --- Option 8: Tidepool Uploader Updater ------------------------------------
-        # Checks installed version on target, compares with latest GitHub release, then
-        # downloads to C:\HCSTools\Software and runs a high-privilege scheduled task to
-        # install silently. Includes retryable hostname prompt and ping check.
-        # -----------------------------------------------------------------------------
-        '8' {
-            if ($null -eq $hostname) {
-                do {
-                    $hostname = Read-Host "Enter the hostname or IP address of the Windows PC"
-                    if ([string]::IsNullOrWhiteSpace($hostname)) {
-                        Write-Host "Hostname cannot be empty." -ForegroundColor Red
-                        continue
-                    }
-                    $pingSuccess = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-                    if (-not $pingSuccess) {
-                        Write-Host "Device $hostname is not reachable via ping." -ForegroundColor Yellow
-                        Write-Host "`nWhat would you like to do?"
-                        Write-Host "1. Try the same hostname again"
-                        Write-Host "2. Enter a different hostname"
-                        Write-Host "3. Return to main menu"
-                        $choice = Read-Host "Select an option (1-3)"
-                        switch ($choice) {
-                            '1' { continue }
-                            '2' { $hostname = $null; continue }
-                            '3' { $hostname = $null; continue 1 }
-                            default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; $hostname = $null; continue 1 }
-                        }
-                    }
-                } while (-not $pingSuccess)
-            }
-            # Create remote session
-            $session = New-PSSession -ComputerName $hostname -Credential $Cred
-
-            # Test session
-            if ($null -eq $session) {
-                Write-Host "Failed to create a session to $hostname" -ForegroundColor Red
-                exit
-            }
-
-            # Get installed Tidepool version by checking executable file version
-            $installedVersion = Invoke-Command -Session $session -ScriptBlock {
-                $exePath = "C:\Program Files\Tidepool Uploader\Tidepool Uploader.exe"
-                if (Test-Path $exePath) {
-                    (Get-Item $exePath).VersionInfo.ProductVersion
-                } else {
-                    ""
-                }
-            }
-            Write-Host "DEBUG: Retrieved InstalledVersion from EXE = '$installedVersion'"
-
-            $installedVersionTrimmed = $installedVersion -replace '^((\d+\.\d+\.\d+)).*','$1'
-            Write-Host "DEBUG: Trimmed InstalledVersion for comparison = '$installedVersionTrimmed'"
-
-            # Get latest version from GitHub
-            $headers = @{ 'User-Agent' = 'RexieTools/1.0' }
-            $latestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/tidepool-org/uploader/releases/latest" -Headers $headers
-            $latestVersion = $latestRelease.tag_name.TrimStart("v")
-
-            Write-Host "Installed Tidepool version on ${hostname}: $installedVersion"
-            Write-Host "Latest available Tidepool version: $latestVersion"
-
-            # Build direct GitHub download URL
-            $downloadUrl = "https://github.com/tidepool-org/uploader/releases/download/v$latestVersion/Tidepool-Uploader-Setup-$latestVersion.exe"
-            $remoteInstallerPath = "C:\HCSTools\Software\Tidepool-Uploader-Setup.exe"
-
-            if ($installedVersionTrimmed -ne $latestVersion) {
-                if (-not $installedVersion) {
-                    Write-Host "Tidepool is not installed on ${hostname}. Latest available version is $latestVersion." -ForegroundColor Yellow
-                } else {
-                    Write-Host "Update recommended. Remote machine has $installedVersion, latest is $latestVersion." -ForegroundColor Yellow
-                }
-
-                # Check if installer already exists on remote machine and matches expected version
-                $installerExists = Invoke-Command -Session $session -ScriptBlock {
-                    $installerPath = "C:\HCSTools\Software\Tidepool-Uploader-Setup.exe"
-                    if (Test-Path $installerPath) {
-                        return $true
-                    } else {
-                        return $false
-                    }
-                }
-
-                if ($installerExists) {
-                    Write-Host "Installer already exists on ${hostname} at C:\HCSTools\Software. Skipping download." -ForegroundColor Cyan
-                } else {
-                    Invoke-Command -Session $session -ScriptBlock {
-                        $downloadUrl = $using:downloadUrl
-                        $installerPath = $using:remoteInstallerPath
-                        Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -Headers @{ 'User-Agent' = 'RexieTools/1.0' }
-                    }
-                    Write-Host "Installer downloaded to remote machine." -ForegroundColor Cyan
-                }
-                # Always attempt to run installer silently, headless with extra logging
-                Invoke-Command -Session $session -ScriptBlock {
-                    $installerPath = $using:remoteInstallerPath
-
-                    # Stop any running Tidepool processes before install
-                    Get-Process | Where-Object { $_.ProcessName -like "*tidepool*" } | Stop-Process -Force -ErrorAction SilentlyContinue
-
-                    # Create and run the scheduled task as SYSTEM with highest privileges
-                    schtasks /Create /TN "RunTidepoolInstaller" /TR "`"$installerPath /S`"" /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F
-                    schtasks /Run /TN "RunTidepoolInstaller"
-                    Write-Host "Scheduled task created and started via schtasks.exe as SYSTEM"
-                }
-                Write-Host "Installer triggered on remote machine via headless scheduled task." -ForegroundColor Cyan
-            } else {
-                Write-Host "Tidepool is up to date." -ForegroundColor Green
-            }
-
-            # Clean up session
-            Remove-PSSession $session
-        }
         # --- Option 1: Group Policy Update -------------------------------------------
         '1' {
-            # Prompt for hostname if it is explicitly null
-            if ($null -eq $hostname) {
-                do {
-                    $hostname = Read-Host "Enter the hostname or IP address of the Windows PC"
-                    if ([string]::IsNullOrWhiteSpace($hostname)) {
-                        Write-Host "Hostname cannot be empty." -ForegroundColor Red
-                        continue
-                    }
-                    $pingSuccess = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-                    if (-not $pingSuccess) {
-                        Write-Host "Device $hostname is not reachable via ping." -ForegroundColor Yellow
-                        Write-Host "`nWhat would you like to do?"
-                        Write-Host "1. Try the same hostname again"
-                        Write-Host "2. Enter a different hostname"
-                        Write-Host "3. Return to main menu"
-                        $choice = Read-Host "Select an option (1-3)"
-                        switch ($choice) {
-                            '1' { continue }
-                            '2' { $hostname = $null; continue }
-                            '3' { $hostname = $null; continue 1 }
-                            default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; $hostname = $null; continue 1 }
-                        }
-                    }
-                } while (-not $pingSuccess)
-            }
+            $hostname = Read-RexieHostname -CurrentHostname $hostname
+            if (-not $hostname) { break }
 
             # Sub-options for GPO-related actions
             Write-Host "`nGPO Actions:" -ForegroundColor Cyan
@@ -563,101 +731,41 @@ $cred = $Cred
                 }
             }
         }
-        # --- Option 7: Event Log Scan -------------------------------------------------
+        # --- Option 2: Event Log Scan ------------------------------------------------
         # Prompts for hours back; queries System & Application logs and prints grouped
         # summaries by Level with a few sample entries.
         # -----------------------------------------------------------------------------
-        '7' {
-            if ($null -eq $hostname) {
-                do {
-                    $hostname = Read-Host "Enter the hostname or IP address of the Windows PC"
-                    if ([string]::IsNullOrWhiteSpace($hostname)) {
-                        Write-Host "Hostname cannot be empty." -ForegroundColor Red
-                        continue
-                    }
-                    $pingSuccess = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-                    if (-not $pingSuccess) {
-                        Write-Host "Device $hostname is not reachable via ping." -ForegroundColor Yellow
-                        Write-Host "`nWhat would you like to do?"
-                        Write-Host "1. Try the same hostname again"
-                        Write-Host "2. Enter a different hostname"
-                        Write-Host "3. Return to main menu"
-                        $choice = Read-Host "Select an option (1-3)"
-                        switch ($choice) {
-                            '1' { continue }
-                            '2' { $hostname = $null; continue }
-                            '3' { $hostname = $null; continue 1 }
-                            default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; $hostname = $null; continue 1 }
-                        }
-                    }
-                } while (-not $pingSuccess)
-            }
-            $scriptBlock = {
-                $hoursBack = Read-Host "How many hours back do you want to scan? (Default: 1)"
-                if ([string]::IsNullOrWhiteSpace($hoursBack)) { $hoursBack = 1 }
-                $startTime = (Get-Date).AddHours(-[int]$hoursBack)
-                $logs = @("System", "Application")
-                foreach ($log in $logs) {
-                    Write-Host "`n===== $log Log =====" -ForegroundColor Yellow
-                    try {
-                        $events = Get-WinEvent -FilterHashtable @{LogName=$log; StartTime=$startTime} -MaxEvents 100 |
-                                  Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message
-
-                        if ($events.Count -eq 0) {
-                            Write-Host "No events found." -ForegroundColor DarkGray
-                            continue
-                        }
-
-                        $grouped = $events | Group-Object LevelDisplayName
-                        foreach ($group in $grouped) {
-                            Write-Host "`n--- $($group.Name) Events ---" -ForegroundColor Cyan
-                            foreach ($entry in $group.Group | Select-Object -First 5) {
-                                Write-Host "[$($entry.TimeCreated)] [$($entry.Id)] $($entry.ProviderName)"
-                                Write-Host "  $($entry.Message.Split("`n")[0])`n"
-                            }
-                        }
-                    } catch {
-                        Write-Host "Could not retrieve $log log: $($_.Exception.Message)" -ForegroundColor Red
-                    }
-                }
-            }
-        }
-        # --- Option 2: Windows Updates View ------------------------------------------
-        # Shows installed hotfixes and generates WindowsUpdate.log for review.
-        # -----------------------------------------------------------------------------
          '2' {
-             # Prompt for hostname if it is explicitly null
-             if ($null -eq $hostname) {
-                 do {
-                     $hostname = Read-Host "Enter the hostname or IP address of the Windows PC"
-                     if ([string]::IsNullOrWhiteSpace($hostname)) {
-                         Write-Host "Hostname cannot be empty." -ForegroundColor Red
-                         continue
-                     }
-                     $pingSuccess = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-                     if (-not $pingSuccess) {
-                         Write-Host "Device $hostname is not reachable via ping." -ForegroundColor Yellow
-                         Write-Host "`nWhat would you like to do?"
-                         Write-Host "1. Try the same hostname again"
-                         Write-Host "2. Enter a different hostname"
-                         Write-Host "3. Return to main menu"
-                         $choice = Read-Host "Select an option (1-3)"
-                         switch ($choice) {
-                             '1' { continue }
-                             '2' { $hostname = $null; continue }
-                             '3' { $hostname = $null; continue 1 }
-                             default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; $hostname = $null; continue 1 }
-                         }
-                     }
-                 } while (-not $pingSuccess)
-             }
+            $hostname = Read-RexieHostname -CurrentHostname $hostname
+            if (-not $hostname) { break }
              $scriptBlock = {
-                 Write-Host "Viewing Installed and Failed Windows Updates..." -ForegroundColor Cyan
-                 Write-Host "Installed Updates:" -ForegroundColor Yellow
-                 Get-HotFix | Format-Table -AutoSize
-                 Write-Host "`nWindows Update Log:" -ForegroundColor Yellow
-                 Get-WindowsUpdateLog
-                 Write-Host "Completed viewing updates." -ForegroundColor Green
+                 $hoursBack = Read-Host "How many hours back do you want to scan? (Default: 1)"
+                 if ([string]::IsNullOrWhiteSpace($hoursBack)) { $hoursBack = 1 }
+                 $startTime = (Get-Date).AddHours(-[int]$hoursBack)
+                 $logs = @("System", "Application")
+                 foreach ($log in $logs) {
+                     Write-Host "`n===== $log Log =====" -ForegroundColor Yellow
+                     try {
+                         $events = Get-WinEvent -FilterHashtable @{LogName=$log; StartTime=$startTime} -MaxEvents 100 |
+                                   Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message
+
+                         if ($events.Count -eq 0) {
+                             Write-Host "No events found." -ForegroundColor DarkGray
+                             continue
+                         }
+
+                         $grouped = $events | Group-Object LevelDisplayName
+                         foreach ($group in $grouped) {
+                             Write-Host "`n--- $($group.Name) Events ---" -ForegroundColor Cyan
+                             foreach ($entry in $group.Group | Select-Object -First 5) {
+                                 Write-Host "[$($entry.TimeCreated)] [$($entry.Id)] $($entry.ProviderName)"
+                                 Write-Host "  $($entry.Message.Split("`n")[0])`n"
+                             }
+                         }
+                     } catch {
+                         Write-Host "Could not retrieve $log log: $($_.Exception.Message)" -ForegroundColor Red
+                     }
+                 }
              }
          }
         # --- Option 3: Computer Info --------------------------------------------------
@@ -665,31 +773,8 @@ $cred = $Cred
         # using CIM queries; includes a fallback for monitor info.
         # -----------------------------------------------------------------------------
          '3' {
-             # Prompt for hostname if it is explicitly null
-             if ($null -eq $hostname) {
-                 do {
-                     $hostname = Read-Host "Enter the hostname or IP address of the Windows PC"
-                     if ([string]::IsNullOrWhiteSpace($hostname)) {
-                         Write-Host "Hostname cannot be empty." -ForegroundColor Red
-                         continue
-                     }
-                     $pingSuccess = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-                     if (-not $pingSuccess) {
-                         Write-Host "Device $hostname is not reachable via ping." -ForegroundColor Yellow
-                         Write-Host "`nWhat would you like to do?"
-                         Write-Host "1. Try the same hostname again"
-                         Write-Host "2. Enter a different hostname"
-                         Write-Host "3. Return to main menu"
-                         $choice = Read-Host "Select an option (1-3)"
-                         switch ($choice) {
-                             '1' { continue }
-                             '2' { $hostname = $null; continue }
-                             '3' { $hostname = $null; continue 1 }
-                             default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; $hostname = $null; continue 1 }
-                         }
-                     }
-                 } while (-not $pingSuccess)
-             }
+            $hostname = Read-RexieHostname -CurrentHostname $hostname
+            if (-not $hostname) { break }
              $scriptBlock = {
                  function Convert-EdidChars {
                      param([uint16[]]$Chars)
@@ -836,31 +921,8 @@ $cred = $Cred
         # Executes dcu-cli.exe /applyUpdates and streams progress to the console.
         # -----------------------------------------------------------------------------
          '4' {
-             # Prompt for hostname if it is explicitly null
-             if ($null -eq $hostname) {
-                 do {
-                     $hostname = Read-Host "Enter the hostname or IP address of the Windows PC"
-                     if ([string]::IsNullOrWhiteSpace($hostname)) {
-                         Write-Host "Hostname cannot be empty." -ForegroundColor Red
-                         continue
-                     }
-                     $pingSuccess = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-                     if (-not $pingSuccess) {
-                         Write-Host "Device $hostname is not reachable via ping." -ForegroundColor Yellow
-                         Write-Host "`nWhat would you like to do?"
-                         Write-Host "1. Try the same hostname again"
-                         Write-Host "2. Enter a different hostname"
-                         Write-Host "3. Return to main menu"
-                         $choice = Read-Host "Select an option (1-3)"
-                         switch ($choice) {
-                             '1' { continue }
-                             '2' { $hostname = $null; continue }
-                             '3' { $hostname = $null; continue 1 }
-                             default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; $hostname = $null; continue 1 }
-                         }
-                     }
-                 } while (-not $pingSuccess)
-             }
+            $hostname = Read-RexieHostname -CurrentHostname $hostname
+            if (-not $hostname) { break }
              $scriptBlock = {
                  $dcuPath = "C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe"
                  if (-Not (Test-Path $dcuPath)) {
@@ -898,31 +960,8 @@ $cred = $Cred
         # Immediate reboot or schedules a one-shot SYSTEM reboot via schtasks.
         # -----------------------------------------------------------------------------
          '5' {
-             # Prompt for hostname if it is explicitly null
-             if ($null -eq $hostname) {
-                 do {
-                     $hostname = Read-Host "Enter the hostname or IP address of the Windows PC"
-                     if ([string]::IsNullOrWhiteSpace($hostname)) {
-                         Write-Host "Hostname cannot be empty." -ForegroundColor Red
-                         continue
-                     }
-                     $pingSuccess = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-                     if (-not $pingSuccess) {
-                         Write-Host "Device $hostname is not reachable via ping." -ForegroundColor Yellow
-                         Write-Host "`nWhat would you like to do?"
-                         Write-Host "1. Try the same hostname again"
-                         Write-Host "2. Enter a different hostname"
-                         Write-Host "3. Return to main menu"
-                         $choice = Read-Host "Select an option (1-3)"
-                         switch ($choice) {
-                             '1' { continue }
-                             '2' { $hostname = $null; continue }
-                             '3' { $hostname = $null; continue 1 }
-                             default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; $hostname = $null; continue 1 }
-                         }
-                     }
-                 } while (-not $pingSuccess)
-             }
+            $hostname = Read-RexieHostname -CurrentHostname $hostname
+            if (-not $hostname) { break }
              $scriptBlock = {
                  $rebootChoice = Read-Host "Do you want to reboot now or schedule it for later? (N/L)"
                  switch ($rebootChoice.ToUpper()) {
@@ -1034,35 +1073,106 @@ $cred = $Cred
                 if ($next -eq '2') { break }
             } while ($true)
         }
+        # --- Option 7: Login Shark ---------------------------------------------------
+        # Session intelligence: active user, logon evidence, lock state, and reboot risk.
+        # -----------------------------------------------------------------------------
+        '7' {
+            Show-LoginSharkSplash
+            $hostname = Read-RexieHostname -CurrentHostname $hostname
+            if (-not $hostname) { break }
+
+            if (-not (Test-RexieWinRM -Hostname $hostname -Credential $Cred)) {
+                Write-Status -Level ERROR -Message "Maximum WinRM connection attempts reached. Returning to menu."
+                break
+            }
+
+            Rexie-LoginShark -Hostname $hostname -Credential $Cred
+            break
+        }
+        # --- Option 8: SCCM / Software Center Actions -------------------------------
+        # Triggers common Configuration Manager client cycles remotely.
+        # -----------------------------------------------------------------------------
+        '8' {
+            Write-Status -Level INFO -Message "Selected option 8 - SCCM / Software Center Actions"
+            $hostname = Read-RexieHostname -CurrentHostname $hostname
+            if (-not $hostname) { break }
+
+            Write-Host "`nSCCM Client Actions:" -ForegroundColor Cyan
+            Write-Host "1. Machine Policy Retrieval"
+            Write-Host "2. User Policy Retrieval"
+            Write-Host "3. Application Deployment Evaluation"
+            Write-Host "4. Software Update Evaluation"
+            Write-Host "5. Hardware Inventory"
+            Write-Host "6. Full Client Check-In (all cycles)"
+
+            $sccmChoice = Read-Host "Select an option (1-6)"
+            $sccmActionName = switch ($sccmChoice) {
+                '1' { 'Machine Policy Retrieval' }
+                '2' { 'User Policy Retrieval' }
+                '3' { 'Application Deployment Evaluation' }
+                '4' { 'Software Update Evaluation' }
+                '5' { 'Hardware Inventory' }
+                '6' { 'Full Client Check-In (all cycles)' }
+                default { 'Invalid / Unknown SCCM action' }
+            }
+            Write-Status -Level INFO -Message "Selected SCCM action: $sccmActionName"
+
+            $scriptBlock = {
+                param($choice)
+
+                $ErrorActionPreference = 'Stop'
+
+                function Invoke-Cycle($guid,$name){
+                    try {
+                        $result = Invoke-WmiMethod -Namespace root\ccm -Class SMS_Client -Name TriggerSchedule -ArgumentList $guid -ErrorAction Stop
+                        $returnCode = $null
+                        if ($null -ne $result -and $result.PSObject.Properties.Name -contains 'ReturnValue') {
+                            $returnCode = [int]$result.ReturnValue
+                        }
+
+                        if ($null -eq $returnCode -or $returnCode -eq 0) {
+                            Write-Host "$name triggered successfully." -ForegroundColor Green
+                        }
+                        else {
+                            Write-Host "$name returned non-zero code: $returnCode" -ForegroundColor Yellow
+                        }
+                    }
+                    catch {
+                        $msg = $_.Exception.Message
+                        Write-Host "Failed to trigger ${name}: $msg" -ForegroundColor Red
+                    }
+                }
+
+                switch($choice){
+                    '1' { Invoke-Cycle '{00000000-0000-0000-0000-000000000021}' 'Machine Policy Retrieval' }
+                    '2' { Invoke-Cycle '{00000000-0000-0000-0000-000000000027}' 'User Policy Retrieval' }
+                    '3' { Invoke-Cycle '{00000000-0000-0000-0000-000000000121}' 'Application Deployment Evaluation' }
+                    '4' { Invoke-Cycle '{00000000-0000-0000-0000-000000000108}' 'Software Update Evaluation' }
+                    '5' { Invoke-Cycle '{00000000-0000-0000-0000-000000000001}' 'Hardware Inventory' }
+                    '6' {
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000021}' 'Machine Policy Retrieval'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000022}' 'Machine Policy Evaluation'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000027}' 'User Policy Retrieval'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000028}' 'User Policy Evaluation'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000121}' 'Application Deployment Evaluation'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000108}' 'Software Update Evaluation'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000001}' 'Hardware Inventory'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000002}' 'Software Inventory'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000003}' 'Discovery Data Collection'
+                    }
+                    default { Write-Host "Invalid selection." -ForegroundColor Yellow }
+                }
+            }
+
+            $scriptArgs = @($sccmChoice)
+        }
         # --- Option 9: Battery Report ------------------------------------------------
         # Generates an HTML battery report on the remote device and saves it to C:\HCSTools.
         # If the device has no battery (desktop), prints an error and exits the option.
         # -----------------------------------------------------------------------------
         '9' {
-            if ($null -eq $hostname) {
-                do {
-                    $hostname = Read-Host "Enter the hostname or IP address of the Windows PC"
-                    if ([string]::IsNullOrWhiteSpace($hostname)) {
-                        Write-Host "Hostname cannot be empty." -ForegroundColor Red
-                        continue
-                    }
-                    $pingSuccess = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-                    if (-not $pingSuccess) {
-                        Write-Host "Device $hostname is not reachable via ping." -ForegroundColor Yellow
-                        Write-Host "`nWhat would you like to do?"
-                        Write-Host "1. Try the same hostname again"
-                        Write-Host "2. Enter a different hostname"
-                        Write-Host "3. Return to main menu"
-                        $choice = Read-Host "Select an option (1-3)"
-                        switch ($choice) {
-                            '1' { continue }
-                            '2' { $hostname = $null; continue }
-                            '3' { $hostname = $null; continue 1 }
-                            default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; $hostname = $null; continue 1 }
-                        }
-                    }
-                } while (-not $pingSuccess)
-            }
+            $hostname = Read-RexieHostname -CurrentHostname $hostname
+            if (-not $hostname) { break }
 
             $scriptBlock = {
                 # Detect battery presence
@@ -1108,25 +1218,6 @@ $cred = $Cred
                 }
             }
         }
-        '10' {
-            if ($null -eq $hostname) {
-                do {
-                    $hostname = Read-Host "Enter the hostname or IP address of the Windows PC"
-                    if ([string]::IsNullOrWhiteSpace($hostname)) {
-                        Write-Host "Hostname cannot be empty." -ForegroundColor Red
-                        continue
-                    }
-                    $pingSuccess = Test-Connection -ComputerName $hostname -Count 1 -Quiet
-                    if (-not $pingSuccess) {
-                        Write-Host "Device $hostname is not reachable via ping." -ForegroundColor Yellow
-                        $hostname = $null
-                        continue
-                    }
-                } while (-not $hostname)
-            }
-
-            Rexie-Robo -Hostname $hostname -Credential $Cred
-        }
         default {
             Write-Host "Invalid selection. Please choose a valid menu option." -ForegroundColor Red
             continue
@@ -1141,8 +1232,8 @@ $cred = $Cred
     #   2) Validates WinRM connectivity with up to 3 credential retries
     #   3) Invokes the previously prepared $scriptBlock on the remote host
     # -----------------------------------------------------------------------------
-    if ($selection -in @('1','2','3','4','5','7','9')) {
-        Write-Status -Level INFO -Message "Selected option $selection"
+    if ($selection -in @('1','2','3','4','5','8','9') -and $scriptBlock) {
+        Write-Status -Level INFO -Message "Executing option $selection on $hostname ..."
 
         # Check if the remote machine is online
         if (-not (Test-Connection -ComputerName $hostname -Count 2 -Quiet)) {

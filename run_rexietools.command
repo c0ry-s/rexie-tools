@@ -3,7 +3,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT_PATH="$SCRIPT_DIR/RexieTools.ps1"
+SCRIPT_PATH="$SCRIPT_DIR/src/RexieTools.ps1"
+
+# Sanity check
+if [[ ! -f "$SCRIPT_PATH" ]]; then
+  echo "Rexie Tools script not found at: $SCRIPT_PATH"
+  echo "Repo layout expects src/RexieTools.ps1"
+  exit 1
+fi
 
 # Find pwsh (works for Intel + Apple Silicon Homebrew)
 PWSH="$(command -v pwsh || true)"
