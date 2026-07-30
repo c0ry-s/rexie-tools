@@ -5,11 +5,11 @@
     Presents a menu of common remote administration tasks (WinRM-based). Stores a universal
     credential (optional) in the user's Documents folder and re-uses it across tasks.
 .VERSION
-    1.0.2
+    1.3.0
 .AUTHOR
     c0ryS (Cory Smith)
 .LAST UPDATED
-    2026-02-26
+    2026-07-30
 .REQUIREMENTS
     • PowerShell 7+
     • Internet access for GitHub version check (if unavailable, script still runs)
@@ -24,23 +24,6 @@
     PositionalBinding     = $false
 )]
 param()
-# Helper to centralize ShouldProcess checks
-
-function Invoke-IfShouldProcess {
-    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
-    param(
-        [Parameter(Mandatory)] [string]$Target,
-        [Parameter(Mandatory)] [string]$Operation,
-        [Parameter(Mandatory)] [scriptblock]$Action
-    )
-    if ($PSCmdlet.ShouldProcess($Target, $Operation)) {
-        try { & $Action }
-        catch { Write-Error -ErrorRecord $_ }
-    }
-    else {
-        Write-Verbose "Skipped: $Operation on $Target"
-    }
-}
 
 # --- Standardized Console Output ---------------------------------------------
 # Levels: INFO, OK, WARN, ERROR, DEBUG
@@ -79,41 +62,9 @@ function Write-Status {
 }
 
 # --- Core Helpers -------------------------------------------------------------
-# Shared helpers for credentials, hostname prompting, WinRM validation, and
-# remote execution. Several menu options depend on these.
+# Shared helpers for hostname prompting, validated menu input, and WinRM
+# connectivity checks. Several menu options depend on these.
 # -----------------------------------------------------------------------------
-function Pause-Rexie {
-    [CmdletBinding()]
-    param([string]$Message = "Press Enter to continue")
-    Read-Host $Message | Out-Null
-}
-
-function Get-RexieCredential {
-    [CmdletBinding()]
-    param([string]$CredPath)
-
-    if (Test-Path $CredPath) {
-        try { return Import-Clixml -Path $CredPath }
-        catch {
-            Write-Status -Level WARN -Message "Stored credential exists but could not be read. Prompting for credentials."
-        }
-    }
-
-    Write-Status -Level WARN -Message "No stored credentials found."
-    $cred = Get-Credential -Message "Enter credentials for remote access"
-
-    $storeAnswer = Read-Host "Do you want to store these credentials for future use? (Y/N)"
-    if ($storeAnswer.ToUpper().StartsWith("Y")) {
-        try {
-            $cred | Export-Clixml -Path $CredPath
-            Write-Status -Level OK -Message "Credentials stored at $CredPath"
-        } catch {
-            Write-Status -Level WARN -Message "Failed to store credentials: $($_.Exception.Message)"
-        }
-    }
-    return $cred
-}
-
 function Read-RexieHostname {
     [CmdletBinding()]
     param(
@@ -144,13 +95,31 @@ function Read-RexieHostname {
         Write-Host "1. Try the same hostname again"
         Write-Host "2. Enter a different hostname"
         Write-Host "3. Return to main menu"
-        $choice = Read-Host "Select an option (1-3)"
-        switch ($choice) {
-            '1' { continue }
-            '2' { continue }
-            '3' { return $null }
-            default { Write-Host "Invalid input. Returning to main menu." -ForegroundColor Yellow; return $null }
-        }
+        $choice = Read-RexieChoice -Prompt "Select an option (1-3)" -ValidChoices '1','2','3'
+        if (-not $choice -or $choice -eq '3') { return $null }
+        # '1' and '2' both just loop back to re-prompt for a hostname
+    }
+}
+
+function Read-RexieChoice {
+    # Returns $null if the user cancels with 'Q' - callers should treat that as
+    # "back out to the main menu" rather than a valid selection.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Prompt,
+        [Parameter(Mandatory)] [string[]]$ValidChoices,
+        [string]$Default
+    )
+
+    while ($true) {
+        $promptText = if ($Default) { "$Prompt [Default: $Default] (Q to cancel)" } else { "$Prompt (Q to cancel)" }
+        $choice = (Read-Host $promptText).ToUpper()
+
+        if ($choice -eq 'Q') { return $null }
+        if ([string]::IsNullOrWhiteSpace($choice) -and $Default) { return $Default }
+        if ($choice -in $ValidChoices) { return $choice }
+
+        Write-Host "Invalid selection. Please enter one of: $($ValidChoices -join ', '), or Q to cancel." -ForegroundColor Yellow
     }
 }
 
@@ -175,39 +144,6 @@ function Test-RexieWinRM {
         }
     }
     return $false
-}
-
-function Invoke-RexieRemote {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [string]$Hostname,
-        [Parameter(Mandatory)] [pscredential]$Credential,
-        [Parameter(Mandatory)] [scriptblock]$ScriptBlock,
-        [object[]]$ArgumentList
-    )
-
-    Write-Status -Level INFO -Message "Selected remote target: $Hostname"
-
-    if (-not (Test-Connection -ComputerName $Hostname -Count 2 -Quiet)) {
-        Write-Status -Level ERROR -Message "Host $Hostname is offline or unreachable."
-        return $null
-    }
-
-    if (-not (Test-RexieWinRM -Hostname $Hostname -Credential $Credential)) {
-        Write-Status -Level ERROR -Message "Maximum WinRM connection attempts reached. Returning to menu."
-        return $null
-    }
-
-    try {
-        if ($ArgumentList) {
-            return Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -ErrorAction Stop
-        } else {
-            return Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock $ScriptBlock -ErrorAction Stop
-        }
-    } catch {
-        Write-Status -Level ERROR -Message "Remote command failed: $($_.Exception.Message)"
-        return $null
-    }
 }
 
 # --- ASCII Splash: Login Shark -------------------------------------------------
@@ -245,7 +181,7 @@ function Show-LoginSharkSplash {
 # Shows active session info, last logged-on user, recent interactive auth events,
 # lock state, and a reboot / remote login recommendation.
 # -------------------------------------------------------------------------------
-function Rexie-LoginShark {
+function Show-LoginShark {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string]$Hostname,
@@ -277,10 +213,12 @@ function Rexie-LoginShark {
     try {
         $interactiveUser = Invoke-Command -ComputerName $Hostname -Credential $Credential -ScriptBlock {
             try {
-                $p = Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($p) {
-                    $o = $p.GetOwner()
-                    if ($o -and $o.User) { return $o.User }
+                $proc = Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop | Select-Object -First 1
+                if ($proc) {
+                    $ownerInfo = Invoke-CimMethod -InputObject $proc -MethodName GetOwner -ErrorAction Stop
+                    if ($ownerInfo -and $ownerInfo.ReturnValue -eq 0 -and $ownerInfo.User) {
+                        return $ownerInfo.User
+                    }
                 }
             } catch { }
             return $null
@@ -425,7 +363,7 @@ function Rexie-LoginShark {
     Write-Host "System Recommendation"
     Write-Host "-------------------------------------------------"
     if ($hasInteractiveUser) {
-        Write-Host "⚠ User session active" -ForegroundColor Yellow
+        Write-Host "[WARN] User session active" -ForegroundColor Yellow
         if ($activeUser) { Write-Host ("User: {0}" -f $activeUser) -ForegroundColor Yellow }
 
         if ($lockState -like 'Locked*') {
@@ -436,11 +374,11 @@ function Rexie-LoginShark {
         Write-Host "Remote login possible (may interrupt user)" -ForegroundColor Yellow
     } else {
         if ($lockState -like 'Locked*' -or $lockState -like 'Unlocked*') {
-            Write-Host "⚠ No ACTIVE quser session detected, but lock/unlock evidence suggests a user was recently present." -ForegroundColor Yellow
+            Write-Host "[WARN] No ACTIVE quser session detected, but lock/unlock evidence suggests a user was recently present." -ForegroundColor Yellow
             Write-Host "Reboot is probably safe, but proceed with caution." -ForegroundColor Yellow
         } else {
-            Write-Host "✓ Safe for reboot" -ForegroundColor Green
-            Write-Host "✓ Safe for remote login" -ForegroundColor Green
+            Write-Host "[OK] Safe for reboot" -ForegroundColor Green
+            Write-Host "[OK] Safe for remote login" -ForegroundColor Green
         }
     }
 
@@ -510,7 +448,7 @@ function Start-HostnameReservationApiRemote {
 }
 
 # Define the current version of this script
-$currentVersion = [version]"1.0.2"
+$currentVersion = [version]"1.3.0"
 
 # TODO: Break repeated code blocks into reusable functions for maintainability.
 
@@ -525,10 +463,10 @@ $versionUrl = "https://raw.githubusercontent.com/$GitHubOwner/$GitHubRepo/$GitHu
 Write-Status -Level INFO -Message "-=*Rexie Tools by c0ryS*=-"
 Write-Host @"
             __
-           / _) 
-    .-^^^-/ / 
- __/       /  
-<__.|_|-|_|   
+           / _)
+    .-^^^-/ /
+ __/       /
+<__.|_|-|_|
 "@ -ForegroundColor Blue
 
 try {
@@ -552,18 +490,22 @@ catch {
     Write-Status -Level WARN -Message "GitHub version check failed: $($_.Exception.Message)"
 }
 #endregion Version Check & Banner (GitHub)
- #region Session Loop & Credential Handling
+#region Session Loop & Credential Handling
 $repeatSession = $true
-do {
+:sessionLoop do {
+
+# Reset per-iteration state so an aborted option can never reuse a stale scriptblock/args
+# from a previous selection.
+$scriptBlock  = $null
+$scriptArgs   = $null
+$justShutDown = $false
 
 # --- Credential Handling ------------------------------------------------------
 # Loads a stored credential from ~/Documents/UniversalCredential.xml when present.
 # If not present, prompts once and optionally persists for future runs.
 # -----------------------------------------------------------------------------
-  # Define the universal credential file path in the user's Documents folder
-   $credPath = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "UniversalCredential.xml"
+$credPath = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "UniversalCredential.xml"
 
-   # Load stored credentials if available; otherwise, prompt and optionally store them
 $Cred = $null
 if (Test-Path $credPath) {
     $Cred = Import-Clixml -Path $credPath
@@ -577,7 +519,6 @@ if (Test-Path $credPath) {
         Write-Status -Level OK -Message "Credentials stored at $credPath"
     }
 }
-$cred = $Cred
 
 # --- Main Menu ---------------------------------------------------------------
     Write-Status -Level INFO -Message "Select an option:"
@@ -585,7 +526,7 @@ $cred = $Cred
     Write-Host "2. Event Log Scan"
     Write-Host "3. View Computer Info"
     Write-Host "4. Run Dell Command Update"
-    Write-Host "5. Schedule One-Time Reboot"
+    Write-Host "5. Reboot / Shutdown (Now or Scheduled)"
     Write-Host "6. Hostname Reservation Assistant"
     Write-Host "7. Login Shark"
     Write-Host "8. SCCM / Software Center Actions"
@@ -604,433 +545,447 @@ $cred = $Cred
             $hostname = Read-RexieHostname -CurrentHostname $hostname
             if (-not $hostname) { break }
 
-            # Sub-options for GPO-related actions
-            Write-Host "`nGPO Actions:" -ForegroundColor Cyan
-            Write-Host "  1. gpupdate /force"
-            Write-Host "  2. Renew machine certificate (certutil -pulse) + verify"
-            Write-Host "  3. Both (gpupdate then cert renew)"
-            Write-Host "  4. Full Skynet Fix (gpupdate /force, gpupdate /force /sync, cert renew + verify)"
-            Write-Host "  5. Request New Cert (certreq -enroll <TemplateName> /machine)"
-            $gpChoice = Read-Host "Select (1-5) [Default: 1]"
-            if ([string]::IsNullOrWhiteSpace($gpChoice)) { $gpChoice = '1' }
+            $scriptBlock = {
+                Write-Host "Running Group Policy Update..." -ForegroundColor Cyan
+                gpupdate /force | Out-String | Write-Host
+                Write-Host "Group Policy Update completed." -ForegroundColor Green
+            }
+        }
+        # --- Option 2: Event Log Scan ------------------------------------------------
+        # Prompts for hours back; queries System & Application logs for Warning/Error/
+        # Critical events and prints grouped summaries by Level with a few sample entries.
+        # -----------------------------------------------------------------------------
+        '2' {
+            $hostname = Read-RexieHostname -CurrentHostname $hostname
+            if (-not $hostname) { break }
+            $scriptBlock = {
+                $hoursBack = Read-Host "How many hours back do you want to scan? (Default: 1)"
+                if ([string]::IsNullOrWhiteSpace($hoursBack)) { $hoursBack = 1 }
+                $startTime = (Get-Date).AddHours(-[int]$hoursBack)
+                $logs = @("System", "Application")
+                foreach ($log in $logs) {
+                    Write-Host "`n===== $log Log =====" -ForegroundColor Yellow
+                    try {
+                        $events = Get-WinEvent -FilterHashtable @{LogName=$log; StartTime=$startTime; Level=1,2,3} -MaxEvents 100 |
+                                  Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message
 
-            switch ($gpChoice) {
-                '2' {
-                    # Cert renew only
-                    $scriptBlock = {
-                        Write-Host "Forcing certificate auto-enrollment (certutil -pulse)..." -ForegroundColor Cyan
-                        certutil -pulse | Out-String | Write-Host
-                        Write-Host "`nValid Client Authentication certificates (LocalMachine\\My):" -ForegroundColor Yellow
-                        try {
-                            Get-ChildItem Cert:\LocalMachine\My |
-                              Where-Object { $_.EnhancedKeyUsageList.FriendlyName -match "Client Authentication" } |
-                              Sort-Object NotAfter -Descending |
-                              Select-Object Subject, NotBefore, NotAfter |
-                              Format-Table -AutoSize
-                        } catch {
-                            Write-Host "Failed to enumerate machine cert store: $($_.Exception.Message)" -ForegroundColor Red
-                        }
-                    }
-                }
-                '3' {
-                    # Both: gpupdate then cert renew
-                    $scriptBlock = {
-                        Write-Host "Running Group Policy Update..." -ForegroundColor Cyan
-                        gpupdate /force | Out-String | Write-Host
-                        Write-Host "Group Policy Update completed." -ForegroundColor Green
-
-                        Write-Host "`nForcing certificate auto-enrollment (certutil -pulse)..." -ForegroundColor Cyan
-                        certutil -pulse | Out-String | Write-Host
-                        Write-Host "`nValid Client Authentication certificates (LocalMachine\\My):" -ForegroundColor Yellow
-                        try {
-                            Get-ChildItem Cert:\LocalMachine\My |
-                              Where-Object { $_.EnhancedKeyUsageList.FriendlyName -match "Client Authentication" } |
-                              Sort-Object NotAfter -Descending |
-                              Select-Object Subject, NotBefore, NotAfter |
-                              Format-Table -AutoSize
-                        } catch {
-                            Write-Host "Failed to enumerate machine cert store: $($_.Exception.Message)" -ForegroundColor Red
-                        }
-                    }
-                }
-                '4' {
-                    $scriptBlock = {
-                        Write-Host "Running Group Policy Update (/force)..." -ForegroundColor Cyan
-                        gpupdate /force | Out-String | Write-Host
-                        Write-Host "Group Policy Update (/force) completed." -ForegroundColor Green
-
-                        # Ask whether to run synchronous Computer GPO and reboot now
-                        $rebootAns = Read-Host "Run synchronous Computer GPO and reboot now? (Y/N) [Default: Y]"
-                        if ([string]::IsNullOrWhiteSpace($rebootAns)) { $rebootAns = 'Y' }
-                        if ($rebootAns.ToUpper().StartsWith('Y')) {
-                            Write-Host "`nRunning Group Policy Update in SYNC mode with reboot..." -ForegroundColor Cyan
-                            Write-Host "This will restart the machine to apply foreground Computer policy. The remote session will disconnect." -ForegroundColor Yellow
-                            gpupdate /target:computer /force /sync /boot | Out-String | Write-Host
-                            return
+                        if ($events.Count -eq 0) {
+                            Write-Host "No events found." -ForegroundColor DarkGray
+                            continue
                         }
 
-                        # No immediate reboot: proceed with SYNC without /boot, then renew certs
-                        Write-Host "`nRunning Group Policy Update in SYNC mode (no reboot)..." -ForegroundColor Cyan
-                        gpupdate /target:computer /force /sync | Out-String | Write-Host
-                        Write-Host "Synchronous Group Policy application completed." -ForegroundColor Green
-
-                        Write-Host "`nForcing certificate auto-enrollment (certutil -pulse)..." -ForegroundColor Cyan
-                        certutil -pulse | Out-String | Write-Host
-
-                        Write-Host "`nVerifying Client Authentication certificates (LocalMachine\\My):" -ForegroundColor Yellow
-                        try {
-                            $clientAuth = Get-ChildItem Cert:\LocalMachine\My | Where-Object {
-                                $_.EnhancedKeyUsageList.FriendlyName -match "Client Authentication"
-                            } | Sort-Object NotAfter -Descending
-
-                            if ($clientAuth) {
-                                $clientAuth | Select-Object Subject, NotBefore, NotAfter | Format-Table -AutoSize
-                            } else {
-                                Write-Host "No Client Authentication certs found." -ForegroundColor Red
+                        $grouped = $events | Group-Object LevelDisplayName
+                        foreach ($group in $grouped) {
+                            Write-Host "`n--- $($group.Name) Events ---" -ForegroundColor Cyan
+                            $distinctEvents = $group.Group | Group-Object Id, ProviderName, { $_.Message.Split("`n")[0] } | Sort-Object { $_.Group[0].TimeCreated } -Descending
+                            foreach ($dup in $distinctEvents | Select-Object -First 5) {
+                                $entry = $dup.Group[0]
+                                $countSuffix = if ($dup.Count -gt 1) { " (x$($dup.Count))" } else { "" }
+                                Write-Host "[$($entry.TimeCreated)] [$($entry.Id)] $($entry.ProviderName)$countSuffix"
+                                Write-Host "  $($entry.Message.Split("`n")[0])`n"
                             }
-                        } catch {
-                            Write-Host "Failed to enumerate machine cert store: $($_.Exception.Message)" -ForegroundColor Red
                         }
-
-                        Write-Host "`nFull Skynet Fix sequence completed (no reboot)." -ForegroundColor Green
-                    }
-                }
-                '5' {
-                    $tmpl = Read-Host "Enter certificate template name (e.g., 'Workstation Authentication'). Leave blank for 'Workstation Authentication'"
-                    if ([string]::IsNullOrWhiteSpace($tmpl)) { $tmpl = 'Workstation Authentication' }
-                    $templateToUse = $tmpl
-                    $scriptBlock = {
-                        param($Template)
-                        Write-Host "Requesting new machine certificate using template: '$Template'..." -ForegroundColor Cyan
-                        try {
-                            certreq -enroll -q $Template /machine | Out-String | Write-Host
-                        } catch {
-                            Write-Host "certreq failed: $($_.Exception.Message)" -ForegroundColor Red
-                        }
-                        Write-Host "`nVerifying Authentication certs (LocalMachine\\My):" -ForegroundColor Yellow
-                        try {
-                            Get-ChildItem Cert:\LocalMachine\My |
-                              Where-Object { $_.EnhancedKeyUsageList.FriendlyName -match "(Server|Client) Authentication" } |
-                              Sort-Object NotAfter -Descending |
-                              Select-Object Subject, Issuer, NotBefore, NotAfter, Thumbprint |
-                              Format-Table -AutoSize
-                        } catch {
-                            Write-Host "Failed to enumerate cert store: $($_.Exception.Message)" -ForegroundColor Red
-                        }
-                    }
-                    # Rebind with the template value for Invoke-Command -ArgumentList
-                    $scriptArgs = @($templateToUse)
-                }
-                Default {
-                    # gpupdate only
-                    $scriptBlock = {
-                        Write-Host "Running Group Policy Update..." -ForegroundColor Cyan
-                        gpupdate /force
-                        Write-Host "Group Policy Update completed." -ForegroundColor Green
+                    } catch {
+                        Write-Host "Could not retrieve $log log: $($_.Exception.Message)" -ForegroundColor Red
                     }
                 }
             }
         }
-        # --- Option 2: Event Log Scan ------------------------------------------------
-        # Prompts for hours back; queries System & Application logs and prints grouped
-        # summaries by Level with a few sample entries.
-        # -----------------------------------------------------------------------------
-         '2' {
-            $hostname = Read-RexieHostname -CurrentHostname $hostname
-            if (-not $hostname) { break }
-             $scriptBlock = {
-                 $hoursBack = Read-Host "How many hours back do you want to scan? (Default: 1)"
-                 if ([string]::IsNullOrWhiteSpace($hoursBack)) { $hoursBack = 1 }
-                 $startTime = (Get-Date).AddHours(-[int]$hoursBack)
-                 $logs = @("System", "Application")
-                 foreach ($log in $logs) {
-                     Write-Host "`n===== $log Log =====" -ForegroundColor Yellow
-                     try {
-                         $events = Get-WinEvent -FilterHashtable @{LogName=$log; StartTime=$startTime} -MaxEvents 100 |
-                                   Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message
-
-                         if ($events.Count -eq 0) {
-                             Write-Host "No events found." -ForegroundColor DarkGray
-                             continue
-                         }
-
-                         $grouped = $events | Group-Object LevelDisplayName
-                         foreach ($group in $grouped) {
-                             Write-Host "`n--- $($group.Name) Events ---" -ForegroundColor Cyan
-                             foreach ($entry in $group.Group | Select-Object -First 5) {
-                                 Write-Host "[$($entry.TimeCreated)] [$($entry.Id)] $($entry.ProviderName)"
-                                 Write-Host "  $($entry.Message.Split("`n")[0])`n"
-                             }
-                         }
-                     } catch {
-                         Write-Host "Could not retrieve $log log: $($_.Exception.Message)" -ForegroundColor Red
-                     }
-                 }
-             }
-         }
         # --- Option 3: Computer Info --------------------------------------------------
-        # Collects model, serial, OS, RAM, CPU, uptime, logged-in user, and monitor data
-        # using CIM queries; includes a fallback for monitor info.
+        # Collects model, serial, OS, RAM, CPU, uptime, logged-in user, BitLocker
+        # encryption status, primary network link, dock detection, and active
+        # monitor info via CIM/WMI queries.
         # -----------------------------------------------------------------------------
-         '3' {
+        '3' {
             $hostname = Read-RexieHostname -CurrentHostname $hostname
             if (-not $hostname) { break }
-             $scriptBlock = {
-                 function Convert-EdidChars {
-                     param([uint16[]]$Chars)
-                     if (-not $Chars) { return "" }
-                     $bytes = @()
-                     foreach ($c in $Chars) {
-                         if ($c -eq 0) { break }
-                         $bytes += [byte]$c
-                     }
-                     return -join ($bytes | ForEach-Object {[char]$_})
-                 }
+            $scriptBlock = {
+                function Convert-EdidChars {
+                    param([uint16[]]$Chars)
+                    if (-not $Chars) { return "" }
+                    $bytes = @()
+                    foreach ($c in $Chars) {
+                        if ($c -eq 0) { break }
+                        $bytes += [byte]$c
+                    }
+                    return -join ($bytes | ForEach-Object {[char]$_})
+                }
 
-                 # --- Core system ---
-                 $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
-                 $bios           = Get-CimInstance -ClassName Win32_BIOS
-                 $os             = Get-CimInstance -ClassName Win32_OperatingSystem
-                 $ram            = Get-CimInstance -ClassName Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum
-                 $totalRAM       = [math]::Round($ram.Sum / 1GB, 2)
+                # --- Core system ---
+                $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+                $bios           = Get-CimInstance -ClassName Win32_BIOS
+                $os             = Get-CimInstance -ClassName Win32_OperatingSystem
+                $ram            = Get-CimInstance -ClassName Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum
+                $totalRAM       = [math]::Round($ram.Sum / 1GB, 2)
 
-                 $totalMem = [float]$os.TotalVisibleMemorySize
-                 $freeMem  = [float]$os.FreePhysicalMemory
-                 $usedMem  = $totalMem - $freeMem
-                 $ramUtil  = if ($totalMem -gt 0) { [math]::Round(($usedMem / $totalMem) * 100, 2) } else { 0 }
+                $totalMem = [float]$os.TotalVisibleMemorySize
+                $freeMem  = [float]$os.FreePhysicalMemory
+                $usedMem  = $totalMem - $freeMem
+                $ramUtil  = if ($totalMem -gt 0) { [math]::Round(($usedMem / $totalMem) * 100, 2) } else { 0 }
 
-                 $cpu           = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
-                 $cpuSpeedGHz   = if ($cpu) { [math]::Round($cpu.MaxClockSpeed / 1000, 2) } else { "N/A" }
+                $cpu           = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
+                $cpuSpeedGHz   = if ($cpu) { [math]::Round($cpu.MaxClockSpeed / 1000, 2) } else { "N/A" }
 
-                 if ($os.LastBootUpTime) {
-                     $uptime = (Get-Date) - $os.LastBootUpTime
-                     $uptimeFormatted = "{0} Days, {1} Hours, {2} Minutes" -f $uptime.Days, $uptime.Hours, $uptime.Minutes
-                 } else {
-                     $uptimeFormatted = "Unavailable"
-                 }
+                if ($os.LastBootUpTime) {
+                    $uptime = (Get-Date) - $os.LastBootUpTime
+                    $uptimeFormatted = "{0} Days, {1} Hours, {2} Minutes" -f $uptime.Days, $uptime.Hours, $uptime.Minutes
+                } else {
+                    $uptimeFormatted = "Unavailable"
+                }
 
-                 # --- Active monitors in use (root\wmi) ---
-                 try {
-                     $monBasic = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction Stop | Where-Object { $_.Active -eq $true }
-                     $monId    = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop
-                     $activeMons = @()
+                # --- Active monitors in use (root\wmi) ---
+                try {
+                    $monBasic = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction Stop | Where-Object { $_.Active -eq $true }
+                    $monId    = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop
+                    $activeMons = @()
 
-                     foreach ($m in $monBasic) {
-                         $idMatch = $monId | Where-Object { $_.InstanceName -eq $m.InstanceName } | Select-Object -First 1
-                         $friendly = if ($idMatch) { Convert-EdidChars $idMatch.UserFriendlyName } else { $null }
-                         $mfg      = if ($idMatch) { Convert-EdidChars $idMatch.ManufacturerName } else { $null }
-                         $serial   = if ($idMatch) { Convert-EdidChars $idMatch.SerialNumberID } else { $null }
+                    foreach ($m in $monBasic) {
+                        $idMatch = $monId | Where-Object { $_.InstanceName -eq $m.InstanceName } | Select-Object -First 1
+                        $friendly = if ($idMatch) { Convert-EdidChars $idMatch.UserFriendlyName } else { $null }
+                        $mfg      = if ($idMatch) { Convert-EdidChars $idMatch.ManufacturerName } else { $null }
+                        $serial   = if ($idMatch) { Convert-EdidChars $idMatch.SerialNumberID } else { $null }
 
-                         $obj = [pscustomobject]@{
-                             InstanceName = $m.InstanceName
-                             FriendlyName = if ([string]::IsNullOrWhiteSpace($friendly)) { $null } else { $friendly }
-                             Manufacturer = if ([string]::IsNullOrWhiteSpace($mfg)) { $null } else { $mfg }
-                             Serial       = if ([string]::IsNullOrWhiteSpace($serial)) { $null } else { $serial }
-                             Manufacture  = if ($m.WeekOfManufacture -gt 0 -and $m.YearOfManufacture -gt 0) { "W{0} {1}" -f $m.WeekOfManufacture, $m.YearOfManufacture } else { $null }
-                             SizeCM       = if ($m.MaxHorizontalImageSize -and $m.MaxVerticalImageSize) { "{0}x{1}" -f $m.MaxHorizontalImageSize, $m.MaxVerticalImageSize } else { $null }
-                         }
-                         $activeMons += $obj
-                     }
-                 } catch {
-                     $activeMons = @()
-                 }
+                        $obj = [pscustomobject]@{
+                            InstanceName = $m.InstanceName
+                            FriendlyName = if ([string]::IsNullOrWhiteSpace($friendly)) { $null } else { $friendly }
+                            Manufacturer = if ([string]::IsNullOrWhiteSpace($mfg)) { $null } else { $mfg }
+                            Serial       = if ([string]::IsNullOrWhiteSpace($serial)) { $null } else { $serial }
+                            Manufacture  = if ($m.WeekOfManufacture -gt 0 -and $m.YearOfManufacture -gt 0) { "W{0} {1}" -f $m.WeekOfManufacture, $m.YearOfManufacture } else { $null }
+                            SizeCM       = if ($m.MaxHorizontalImageSize -and $m.MaxVerticalImageSize) { "{0}x{1}" -f $m.MaxHorizontalImageSize, $m.MaxVerticalImageSize } else { $null }
+                        }
+                        $activeMons += $obj
+                    }
+                } catch {
+                    $activeMons = @()
+                }
 
-                 # --- Dock detection (heuristic over PnP entities) ---
-                 $dockPatterns = '(?i)(dock|port replicator|usb[-\s]?c dock|thunderbolt\s*dock|wd1[59]|wd2[02]|tb16|k16a|ultra\s*dock|kensington\s*sd|thinkpad\s*dock|plugable|wavlink)'
-                 try {
-                     $dockDevices = Get-CimInstance Win32_PnPEntity -ErrorAction Stop |
-                                    Where-Object { ($_.PNPClass -eq 'Dock') -or ($_.Name -match $dockPatterns) -or ($_.Description -match $dockPatterns) }
-                 } catch {
-                     $dockDevices = @()
-                 }
-                 $isDocked = if ($dockDevices -and $dockDevices.Count -gt 0) { "Yes" } else { "No or Unknown" }
+                # --- Dock detection (heuristic over PnP entities) ---
+                $dockPatterns = '(?i)(dock|port replicator|usb[-\s]?c dock|thunderbolt\s*dock|wd1[59]|wd2[02]|tb16|k16a|ultra\s*dock|kensington\s*sd|thinkpad\s*dock|plugable|wavlink)'
+                try {
+                    $dockDevices = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop |
+                                   Where-Object { ($_.PNPClass -eq 'Dock') -or ($_.Name -match $dockPatterns) -or ($_.Description -match $dockPatterns) })
+                } catch {
+                    $dockDevices = @()
+                }
+                $isDocked = if ($dockDevices.Count -gt 0) { "Yes" } else { "No or Unknown" }
 
-                 # --- Primary network (Wi‑Fi vs Ethernet) ---
-                 try {
-                     $adaptersUp = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' }
-                     $ipcfg = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -First 1
-                     $primaryIf = $null
-                     if ($ipcfg) {
-                         $primaryIf = $adaptersUp | Where-Object { $_.InterfaceIndex -eq $ipcfg.InterfaceIndex } | Select-Object -First 1
-                     }
-                     if (-not $primaryIf) { $primaryIf = $adaptersUp | Select-Object -First 1 }
+                # --- Primary network (Wi‑Fi vs Ethernet) ---
+                try {
+                    $adaptersUp = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' }
+                    $ipcfg = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -First 1
+                    $primaryIf = $null
+                    if ($ipcfg) {
+                        $primaryIf = $adaptersUp | Where-Object { $_.InterfaceIndex -eq $ipcfg.InterfaceIndex } | Select-Object -First 1
+                    }
+                    if (-not $primaryIf) { $primaryIf = $adaptersUp | Select-Object -First 1 }
 
-                     if ($primaryIf) {
-                         $isWifi = ($primaryIf.NdisPhysicalMedium -eq 9) -or ($primaryIf.InterfaceDescription -match '(?i)wi-?fi|wlan|802\.11')
-                         $netType = if ($isWifi) { 'Wi-Fi' } else { 'Ethernet' }
-                         $netOut  = "{0} ({1})" -f $netType, $primaryIf.InterfaceAlias
-                         $ipAddr  = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $primaryIf.InterfaceIndex -ErrorAction SilentlyContinue |
-                                     Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
-                                     Select-Object -ExpandProperty IPAddress -First 1)
-                     } else {
-                         $netOut = "Unknown"
-                         $ipAddr = $null
-                     }
-                 } catch {
-                     $netOut = "Unknown"
-                     $ipAddr = $null
-                 }
+                    if ($primaryIf) {
+                        $isWifi = ($primaryIf.NdisPhysicalMedium -eq 9) -or ($primaryIf.InterfaceDescription -match '(?i)wi-?fi|wlan|802\.11')
+                        $netType = if ($isWifi) { 'Wi-Fi' } else { 'Ethernet' }
+                        $netOut  = "{0} ({1})" -f $netType, $primaryIf.InterfaceAlias
+                        $ipAddr  = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $primaryIf.InterfaceIndex -ErrorAction SilentlyContinue |
+                                    Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
+                                    Select-Object -ExpandProperty IPAddress -First 1)
+                    } else {
+                        $netOut = "Unknown"
+                        $ipAddr = $null
+                    }
+                } catch {
+                    $netOut = "Unknown"
+                    $ipAddr = $null
+                }
 
-                 # --- Output ---
-                 Write-Host "`n===== System Info ====="
-                 Write-Host "Model:           $($computerSystem.Model)"
-                 Write-Host "Serial Number:   $($bios.SerialNumber)"
-                 Write-Host "OS:              $($os.Caption)"
-                 Write-Host "OS Version:      $($os.Version)"
-                 Write-Host "OS Build:        $($os.BuildNumber)"
-                 Write-Host "Total RAM (GB):  $totalRAM"
-                 Write-Host "RAM Used:        $ramUtil%"
-                 Write-Host "CPU Speed (GHz): $cpuSpeedGHz"
-                 Write-Host "Uptime:          $uptimeFormatted"
-                 Write-Host "Logged-in User:  $($computerSystem.UserName)"
+                # --- Encryption / BitLocker Status ---
+                $bitlockerStatus = "Unknown"
+                $bitlockerColor  = "Yellow"
 
-                 # Network
-                 Write-Host "`n===== Network ====="
-                 Write-Host "Primary Link:    $netOut"
-                 if ($ipAddr) { Write-Host "IPv4 Address:    $ipAddr" }
+                try {
+                    $blv = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
 
-                 # Dock
-                 Write-Host "`n===== Dock ====="
-                 Write-Host "Dock Detected:   $isDocked"
-                 if ($dockDevices) {
-                     $dockDevices | Select-Object -First 2 | ForEach-Object {
-                         $dockName = if ($_.Name) { $_.Name } elseif ($_.Description) { $_.Description } else { '' }
-                         Write-Host (" - {0}" -f $dockName)
-                     }
-                     if ($dockDevices.Count -gt 2) { Write-Host (" (+{0} more devices matched 'dock')" -f ($dockDevices.Count - 2)) }
-                 }
+                    if ($blv.ProtectionStatus -eq 'On') {
+                        $bitlockerStatus = "Encrypted"
+                        $bitlockerColor  = "Green"
+                    }
+                    else {
+                        $bitlockerStatus = "NOT Encrypted"
+                        $bitlockerColor  = "Red"
+                    }
+                }
+                catch {
+                    try {
+                        # Fallback for systems without BitLocker module
+                        $manageBde = manage-bde -status $env:SystemDrive 2>$null
 
-                 # Monitors in use
-                 Write-Host "`n===== Monitors In Use (Active) ====="
-                 if (-not $activeMons -or $activeMons.Count -eq 0) {
-                     Write-Host "No active external displays detected via WMI (root\wmi)."
-                 } else {
-                     $idx = 1
-                     foreach ($m in $activeMons) {
-                         $name = if ($m.FriendlyName) { $m.FriendlyName } elseif ($m.Manufacturer) { $m.Manufacturer } else { $m.InstanceName }
-                         $serialOut = if ($m.Serial) { $m.Serial } else { 'n/a' }
-                         $sizeOut   = if ($m.SizeCM) { $m.SizeCM } else { 'n/a' }
-                         $mfgOut    = if ($m.Manufacture) { $m.Manufacture } else { '' }
-                         Write-Host ("{0}. {1}  Serial: {2}  Size(cm): {3}  {4}" -f $idx, $name, $serialOut, $sizeOut, $mfgOut)
-                         $idx++
-                     }
-                 }
-             }
-         }
+                        if ($manageBde -match "Protection Status:\s+Protection On") {
+                            $bitlockerStatus = "Encrypted"
+                            $bitlockerColor  = "Green"
+                        }
+                        elseif ($manageBde -match "Protection Status:\s+Protection Off") {
+                            $bitlockerStatus = "NOT Encrypted"
+                            $bitlockerColor  = "Red"
+                        }
+                    }
+                    catch {
+                        $bitlockerStatus = "Unable to determine"
+                        $bitlockerColor  = "Yellow"
+                    }
+                }
+                # --- Output ---
+                Write-Host "`n===== System Info ====="
+                Write-Host "Model:           $($computerSystem.Model)"
+                Write-Host "Serial Number:   $($bios.SerialNumber)"
+                Write-Host "OS:              $($os.Caption)"
+                Write-Host "OS Version:      $($os.Version)"
+                Write-Host "OS Build:        $($os.BuildNumber)"
+                Write-Host "Encryption:      $bitlockerStatus" -ForegroundColor $bitlockerColor
+                Write-Host "Total RAM (GB):  $totalRAM"
+                Write-Host "RAM Used:        $ramUtil%"
+                Write-Host "CPU Speed (GHz): $cpuSpeedGHz"
+                Write-Host "Uptime:          $uptimeFormatted"
+                Write-Host "Logged-in User:  $($computerSystem.UserName)"
+
+                # Network
+                Write-Host "`n===== Network ====="
+                Write-Host "Primary Link:    $netOut"
+                if ($ipAddr) { Write-Host "IPv4 Address:    $ipAddr" }
+
+                # Dock
+                Write-Host "`n===== Dock ====="
+                Write-Host "Dock Detected:   $isDocked"
+                if ($dockDevices) {
+                    $dockDevices | Select-Object -First 2 | ForEach-Object {
+                        $dockName = if ($_.Name) { $_.Name } elseif ($_.Description) { $_.Description } else { '' }
+                        Write-Host (" - {0}" -f $dockName)
+                    }
+                    if ($dockDevices.Count -gt 2) { Write-Host (" (+{0} more devices matched 'dock')" -f ($dockDevices.Count - 2)) }
+                }
+
+                # Monitors in use
+                Write-Host "`n===== Monitors In Use (Active) ====="
+                if (-not $activeMons -or $activeMons.Count -eq 0) {
+                    Write-Host "No active external displays detected via WMI (root\wmi)."
+                } else {
+                    $idx = 1
+                    foreach ($m in $activeMons) {
+                        $name = if ($m.FriendlyName) { $m.FriendlyName } elseif ($m.Manufacturer) { $m.Manufacturer } else { $m.InstanceName }
+                        $serialOut = if ($m.Serial) { $m.Serial } else { 'n/a' }
+                        $sizeOut   = if ($m.SizeCM) { $m.SizeCM } else { 'n/a' }
+                        $mfgOut    = if ($m.Manufacture) { $m.Manufacture } else { '' }
+                        Write-Host ("{0}. {1}  Serial: {2}  Size(cm): {3}  {4}" -f $idx, $name, $serialOut, $sizeOut, $mfgOut)
+                        $idx++
+                    }
+                }
+            }
+        }
         # --- Option 4: Dell Command Update -------------------------------------------
-        # Executes dcu-cli.exe /applyUpdates and streams progress to the console.
+        # Executes dcu-cli.exe /applyUpdates, streams live progress to the console,
+        # and reports a human-readable meaning for the exit code (see Dell's CLI
+        # Reference Guide for the full code list).
         # -----------------------------------------------------------------------------
-         '4' {
+        '4' {
             $hostname = Read-RexieHostname -CurrentHostname $hostname
             if (-not $hostname) { break }
-             $scriptBlock = {
-                 $dcuPath = "C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe"
-                 if (-Not (Test-Path $dcuPath)) {
-                     Write-Host "Dell Command Update CLI not found at $dcuPath" -ForegroundColor Red
-                     return
-                 }
- 
-                 Write-Host "Running Dell Command Update..." -ForegroundColor Cyan
- 
-                 $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-                 $processInfo.FileName = $dcuPath
-                 $processInfo.Arguments = "/applyUpdates"
-                 $processInfo.RedirectStandardOutput = $true
-                 $processInfo.UseShellExecute = $false
-                 $processInfo.CreateNoWindow = $true
- 
-                 $process = [System.Diagnostics.Process]::Start($processInfo)
-                 $reader = $process.StandardOutput
- 
-                 while (-not $reader.EndOfStream) {
-                     $line = $reader.ReadLine()
-                     if ($line -match "Progress: (\d+)%") {
-                         $percent = [int]$matches[1]
-                         Write-Progress -Activity "Dell Updates" -Status "$percent% Complete" -PercentComplete $percent
-                     } else {
-                         Write-Host $line
-                     }
-                 }
- 
-                 $process.WaitForExit()
-                 Write-Host "Dell updates completed with exit code: $($process.ExitCode)" -ForegroundColor Green
-             }
-         }
-        # --- Option 5: One-Time Reboot -----------------------------------------------
-        # Immediate reboot or schedules a one-shot SYSTEM reboot via schtasks.
+            $scriptBlock = {
+                $dcuPath = "C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe"
+                if (-Not (Test-Path $dcuPath)) {
+                    Write-Host "Dell Command Update CLI not found at $dcuPath" -ForegroundColor Red
+                    return
+                }
+
+                Write-Host "Running Dell Command Update..." -ForegroundColor Cyan
+
+                $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $processInfo.FileName = $dcuPath
+                $processInfo.Arguments = "/applyUpdates"
+                $processInfo.RedirectStandardOutput = $true
+                $processInfo.UseShellExecute = $false
+                $processInfo.CreateNoWindow = $true
+
+                $process = [System.Diagnostics.Process]::Start($processInfo)
+                $reader = $process.StandardOutput
+
+                while (-not $reader.EndOfStream) {
+                    $line = $reader.ReadLine()
+                    if ($line -match "Progress: (\d+)%") {
+                        $percent = [int]$matches[1]
+                        Write-Progress -Activity "Dell Updates" -Status "$percent% Complete" -PercentComplete $percent
+                    } else {
+                        Write-Host $line
+                    }
+                }
+
+                $process.WaitForExit()
+
+                # Source: Dell Command | Update CLI Reference Guide - Exit/Error Codes
+                $dcuExitCodes = @{
+                    0    = 'Success'
+                    1    = 'Success - reboot required'
+                    2    = 'Unknown application error'
+                    3    = 'System manufacturer is not Dell'
+                    4    = 'CLI was not launched with administrative privilege'
+                    5    = 'A reboot was pending from a previous operation'
+                    6    = 'Another instance of Dell Command Update is already running'
+                    7    = 'This system model is not supported'
+                    8    = 'No update filters have been applied or configured'
+                    500  = 'No updates were found for the system'
+                    501  = 'An error occurred while determining the available updates'
+                    502  = 'The operation was cancelled'
+                    503  = 'An error occurred while downloading a file during the scan'
+                    1000 = 'An error occurred retrieving the result of the apply updates operation'
+                    1001 = 'The operation was cancelled'
+                    1002 = 'An error occurred while downloading a file during the apply updates operation'
+                }
+
+                $exitCode = $process.ExitCode
+                $successCodes = @(0)
+                $benignCodes  = @(1, 5, 500, 502, 1001)
+
+                $description = $dcuExitCodes[$exitCode]
+                if (-not $description) {
+                    if ($exitCode -ge 100 -and $exitCode -le 113) {
+                        $description = 'Invalid command-line parameters'
+                    } else {
+                        $description = 'Unrecognized exit code'
+                    }
+                }
+
+                $exitColor = if ($exitCode -in $successCodes) { 'Green' } elseif ($exitCode -in $benignCodes) { 'Yellow' } else { 'Red' }
+                Write-Host "Dell updates completed with exit code $exitCode - $description" -ForegroundColor $exitColor
+            }
+        }
+        # --- Option 5: One-Time Reboot / Shutdown ------------------------------------
+        # Immediate or scheduled one-shot SYSTEM reboot/shutdown via schtasks.
         # -----------------------------------------------------------------------------
-         '5' {
+        '5' {
             $hostname = Read-RexieHostname -CurrentHostname $hostname
             if (-not $hostname) { break }
-             $scriptBlock = {
-                 $rebootChoice = Read-Host "Do you want to reboot now or schedule it for later? (N/L)"
-                 switch ($rebootChoice.ToUpper()) {
-                     'N' {
-                         Write-Host "Rebooting now. Goodbye!" -ForegroundColor Cyan
-                         shutdown.exe /r /t 0
-                         exit
-                     }
-                     'L' {
-                         $validInput = $false
-                         while (-not $validInput) {
-                             try {
-                                 $defaultDate = (Get-Date).ToString("MM/dd/yyyy")
-                                 $defaultTime = "18:00"
-                                 $rebootDate = Read-Host -Prompt "Enter the reboot date (MM/DD/YYYY) [Default: $defaultDate]"
-                                 if ([string]::IsNullOrWhiteSpace($rebootDate)) { $rebootDate = $defaultDate }
-                                 $rebootTime = Read-Host -Prompt "Enter the reboot time (HH:MM in 24-hour format) [Default: $defaultTime]"
-                                 if ([string]::IsNullOrWhiteSpace($rebootTime)) { $rebootTime = $defaultTime }
- 
-                                 if ($rebootDate -notmatch "/") {
-                                     $rebootDate = $rebootDate.Insert(2, "/").Insert(5, "/")
-                                 }
-                                 if ($rebootTime -notmatch ":") {
-                                     $rebootTime = $rebootTime.Insert(2, ":")
-                                 }
- 
-                                 $scheduledDateTime = [datetime]::ParseExact("$rebootDate $rebootTime", "MM/dd/yyyy HH:mm", $null)
- 
-                                 if ($scheduledDateTime -lt (Get-Date)) {
-                                     Write-Host "Time is in the past. Enter a future date/time." -ForegroundColor Yellow
-                                 } else {
-                                     $validInput = $true
-                                 }
-                             } catch {
-                                 Write-Host "Invalid format. Use MM/DD/YYYY and HH:MM (24-hour format)." -ForegroundColor Red
-                             }
-                         }
- 
-                         $formattedTime = $scheduledDateTime.ToString("HH:mm")
-                         $formattedDate = $scheduledDateTime.ToString("MM/dd/yyyy")
-                         $schtasksCommand = "schtasks /create /tn 'OneTimeReboot' /tr 'shutdown.exe /r /t 0' /sc once /sd $formattedDate /st $formattedTime /RU SYSTEM /F"
- 
-                         Invoke-Expression $schtasksCommand
-                         Write-Host "Scheduled reboot at $scheduledDateTime." -ForegroundColor Green
-                     }
-                     default {
-                         Write-Host "Invalid selection. Cancelling reboot." -ForegroundColor Yellow
-                     }
-                 }
-             }
-         }
+            $scriptBlock = {
+                $isShutdown = $false
+                :actionPrompt while ($true) {
+                    $actionChoice = $null
+                    while ($actionChoice -notin @('R','S')) {
+                        $actionChoice = (Read-Host "Reboot or shut down the machine? (R/S, or Q to cancel)").ToUpper()
+                        if ($actionChoice -eq 'Q') { Write-Host "Cancelled." -ForegroundColor Yellow; return }
+                        if ($actionChoice -notin @('R','S')) {
+                            Write-Host "Invalid selection. Please enter R or S, or Q to cancel." -ForegroundColor Yellow
+                        }
+                    }
+
+                    if ($actionChoice -eq 'R') {
+                        $isShutdown = $false
+                        break actionPrompt
+                    }
+
+                    Write-Host "WARNING: This device will be unavailable until it is manually powered back on." -ForegroundColor Red
+                    $confirmChoice = $null
+                    while ($confirmChoice -notin @('Y','N','B')) {
+                        $confirmChoice = (Read-Host "Are you sure you want to shut down? (Y/N/B to go back)").ToUpper()
+                        if ($confirmChoice -notin @('Y','N','B')) {
+                            Write-Host "Invalid selection. Please enter Y, N, or B." -ForegroundColor Yellow
+                        }
+                    }
+                    switch ($confirmChoice) {
+                        'Y' { $isShutdown = $true; break actionPrompt }
+                        'N' { Write-Host "Cancelled." -ForegroundColor Yellow; return }
+                        'B' { continue actionPrompt }
+                    }
+                }
+                $powerFlag  = if ($isShutdown) { '/s' } else { '/r' }
+                $actionName = if ($isShutdown) { 'Shutdown' } else { 'Reboot' }
+                $taskName   = "OneTime$actionName"
+
+                $timingChoice = $null
+                while ($timingChoice -notin @('N','L')) {
+                    $timingChoice = (Read-Host "Do you want to $($actionName.ToLower()) now or schedule it for later? (N/L, or Q to cancel)").ToUpper()
+                    if ($timingChoice -eq 'Q') { Write-Host "Cancelled." -ForegroundColor Yellow; return }
+                    if ($timingChoice -notin @('N','L')) {
+                        Write-Host "Invalid selection. Please enter N or L, or Q to cancel." -ForegroundColor Yellow
+                    }
+                }
+                switch ($timingChoice) {
+                    'N' {
+                        Write-Host "$actionName now. Goodbye!" -ForegroundColor Cyan
+                        if ($isShutdown) { "__SHUTDOWN_NOW__" } else { "__REBOOT_NOW__" }
+                        shutdown.exe $powerFlag /t 0
+                        exit
+                    }
+                    'L' {
+                        $validInput = $false
+                        while (-not $validInput) {
+                            try {
+                                $defaultDate = (Get-Date).ToString("MM/dd/yyyy")
+                                $defaultTime = "18:00"
+                                $inputDate = Read-Host -Prompt "Enter the $($actionName.ToLower()) date (MM/DD/YYYY) [Default: $defaultDate]"
+                                if ([string]::IsNullOrWhiteSpace($inputDate)) { $inputDate = $defaultDate }
+                                $inputTime = Read-Host -Prompt "Enter the $($actionName.ToLower()) time (HH:MM in 24-hour format) [Default: $defaultTime]"
+                                if ([string]::IsNullOrWhiteSpace($inputTime)) { $inputTime = $defaultTime }
+
+                                if ($inputDate -notmatch "/") {
+                                    $inputDate = $inputDate.Insert(2, "/").Insert(5, "/")
+                                }
+                                if ($inputTime -notmatch ":") {
+                                    $inputTime = $inputTime.Insert(2, ":")
+                                }
+
+                                $scheduledDateTime = [datetime]::ParseExact("$inputDate $inputTime", "MM/dd/yyyy HH:mm", $null)
+
+                                if ($scheduledDateTime -lt (Get-Date)) {
+                                    Write-Host "Time is in the past. Enter a future date/time." -ForegroundColor Yellow
+                                } else {
+                                    $validInput = $true
+                                }
+                            } catch {
+                                Write-Host "Invalid format. Use MM/DD/YYYY and HH:MM (24-hour format)." -ForegroundColor Red
+                            }
+                        }
+
+                        $formattedTime = $scheduledDateTime.ToString("HH:mm")
+                        $formattedDate = $scheduledDateTime.ToString("MM/dd/yyyy")
+                        # Task deletes itself right before the power action so it doesn't linger in Task Scheduler.
+                        $trCommand = "cmd.exe /c `"schtasks /delete /tn $taskName /f & shutdown.exe $powerFlag /t 0`""
+
+                        schtasks /create /tn $taskName /tr $trCommand /sc once /sd $formattedDate /st $formattedTime /RU SYSTEM /F
+                        Write-Host "Scheduled $($actionName.ToLower()) at $scheduledDateTime." -ForegroundColor Green
+                    }
+                }
+            }
+        }
         # --- Option 6: Hostname Reservation Assistant --------------------------------
-        # Validates a 13-character base then POSTs to RXCRY01TECHLT01:8080 for the next
-        # available device number and shows the response.
+        # Validates a 13-character base and how many hostnames are needed, then POSTs
+        # "base|count" to RXCRY01TECHLT01:8080 and shows the available hostname(s).
+        # The API computes gaps against live AD state on every call - it does not
+        # reserve anything, so the count must be requested server-side, not guessed
+        # by incrementing a single result locally.
         # -----------------------------------------------------------------------------
         '6' {
-            do {
+            :hostnameLoop do {
                 do {
-                    $base = Read-Host "Enter the 13-character hostname base (e.g., RXCARY01OBGYN)"
+                    $base = (Read-Host "Enter the 13-character hostname base (e.g., RXCRY01TECHLT), or Q to cancel").ToUpper()
+                    if ($base -eq 'Q') { Write-Host "Cancelled." -ForegroundColor Yellow; break hostnameLoop }
                     if ($base.Length -ne 13 -or $base -notmatch '^[A-Z0-9]{13}$') {
-                        Write-Host "`nInvalid input. Must be exactly 13 uppercase alphanumeric characters." -ForegroundColor Red
+                        Write-Host "`nInvalid input. Must be exactly 13 alphanumeric characters, or Q to cancel." -ForegroundColor Red
                         $base = $null
                     }
                 } while (-not $base)
 
+                $count = $null
+                while (-not $count) {
+                    $countInput = Read-Host "How many hostnames do you need? (Default: 1, or Q to cancel)"
+                    if ($countInput.ToUpper() -eq 'Q') { Write-Host "Cancelled." -ForegroundColor Yellow; break hostnameLoop }
+                    if ([string]::IsNullOrWhiteSpace($countInput)) {
+                        $count = 1
+                    } elseif ($countInput -match '^\d+$' -and [int]$countInput -ge 1 -and [int]$countInput -le 99) {
+                        $count = [int]$countInput
+                    } else {
+                        Write-Host "Invalid input. Enter a number from 1-99, leave blank for 1, or Q to cancel." -ForegroundColor Red
+                    }
+                }
+
                 $uri = "http://$HostnameApiHost`:$HostnameApiPort/"
+                $requestBody = "$base|$count"
 
                 try {
-                    $response = Invoke-RestMethod -Method POST -Uri $uri -Body $base
+                    $response = Invoke-RestMethod -Method POST -Uri $uri -Body $requestBody -TimeoutSec 10
                     Write-Host "`n$response" -ForegroundColor Green
                 } catch {
                     $errMsg = $_.Exception.Message
@@ -1052,7 +1007,7 @@ $cred = $Cred
                         if (Test-TcpPort -HostName $HostnameApiHost -Port $HostnameApiPort) {
                             Write-Status -Level OK -Message "API port is responding. Retrying request..."
                             try {
-                                $response2 = Invoke-RestMethod -Method POST -Uri $uri -Body $base
+                                $response2 = Invoke-RestMethod -Method POST -Uri $uri -Body $requestBody -TimeoutSec 10
                                 Write-Host "`n$response2" -ForegroundColor Green
                             } catch {
                                 Write-Status -Level ERROR -Message "Retry failed: $($_.Exception.Message)"
@@ -1069,8 +1024,8 @@ $cred = $Cred
                 Write-Host "`nWhat would you like to do next?"
                 Write-Host "1. Try another hostname"
                 Write-Host "2. Return to main menu"
-                $next = Read-Host "Select an option (1-2)"
-                if ($next -eq '2') { break }
+                $next = Read-RexieChoice -Prompt "Select an option (1-2)" -ValidChoices '1','2'
+                if (-not $next -or $next -eq '2') { break }
             } while ($true)
         }
         # --- Option 7: Login Shark ---------------------------------------------------
@@ -1086,7 +1041,7 @@ $cred = $Cred
                 break
             }
 
-            Rexie-LoginShark -Hostname $hostname -Credential $Cred
+            Show-LoginShark -Hostname $hostname -Credential $Cred
             break
         }
         # --- Option 8: SCCM / Software Center Actions -------------------------------
@@ -1105,7 +1060,8 @@ $cred = $Cred
             Write-Host "5. Hardware Inventory"
             Write-Host "6. Full Client Check-In (all cycles)"
 
-            $sccmChoice = Read-Host "Select an option (1-6)"
+            $sccmChoice = Read-RexieChoice -Prompt "Select an option (1-6)" -ValidChoices '1','2','3','4','5','6'
+            if (-not $sccmChoice) { break }
             $sccmActionName = switch ($sccmChoice) {
                 '1' { 'Machine Policy Retrieval' }
                 '2' { 'User Policy Retrieval' }
@@ -1113,7 +1069,6 @@ $cred = $Cred
                 '4' { 'Software Update Evaluation' }
                 '5' { 'Hardware Inventory' }
                 '6' { 'Full Client Check-In (all cycles)' }
-                default { 'Invalid / Unknown SCCM action' }
             }
             Write-Status -Level INFO -Message "Selected SCCM action: $sccmActionName"
 
@@ -1124,7 +1079,7 @@ $cred = $Cred
 
                 function Invoke-Cycle($guid,$name){
                     try {
-                        $result = Invoke-WmiMethod -Namespace root\ccm -Class SMS_Client -Name TriggerSchedule -ArgumentList $guid -ErrorAction Stop
+                        $result = Invoke-CimMethod -Namespace 'root\ccm' -ClassName 'SMS_Client' -MethodName 'TriggerSchedule' -Arguments @{ sScheduleID = $guid } -ErrorAction Stop
                         $returnCode = $null
                         if ($null -ne $result -and $result.PSObject.Properties.Name -contains 'ReturnValue') {
                             $returnCode = [int]$result.ReturnValue
@@ -1145,15 +1100,15 @@ $cred = $Cred
 
                 switch($choice){
                     '1' { Invoke-Cycle '{00000000-0000-0000-0000-000000000021}' 'Machine Policy Retrieval' }
-                    '2' { Invoke-Cycle '{00000000-0000-0000-0000-000000000027}' 'User Policy Retrieval' }
+                    '2' { Invoke-Cycle '{00000000-0000-0000-0000-000000000026}' 'User Policy Retrieval' }
                     '3' { Invoke-Cycle '{00000000-0000-0000-0000-000000000121}' 'Application Deployment Evaluation' }
                     '4' { Invoke-Cycle '{00000000-0000-0000-0000-000000000108}' 'Software Update Evaluation' }
                     '5' { Invoke-Cycle '{00000000-0000-0000-0000-000000000001}' 'Hardware Inventory' }
                     '6' {
                         Invoke-Cycle '{00000000-0000-0000-0000-000000000021}' 'Machine Policy Retrieval'
                         Invoke-Cycle '{00000000-0000-0000-0000-000000000022}' 'Machine Policy Evaluation'
-                        Invoke-Cycle '{00000000-0000-0000-0000-000000000027}' 'User Policy Retrieval'
-                        Invoke-Cycle '{00000000-0000-0000-0000-000000000028}' 'User Policy Evaluation'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000026}' 'User Policy Retrieval'
+                        Invoke-Cycle '{00000000-0000-0000-0000-000000000027}' 'User Policy Evaluation'
                         Invoke-Cycle '{00000000-0000-0000-0000-000000000121}' 'Application Deployment Evaluation'
                         Invoke-Cycle '{00000000-0000-0000-0000-000000000108}' 'Software Update Evaluation'
                         Invoke-Cycle '{00000000-0000-0000-0000-000000000001}' 'Hardware Inventory'
@@ -1220,11 +1175,9 @@ $cred = $Cred
         }
         default {
             Write-Host "Invalid selection. Please choose a valid menu option." -ForegroundColor Red
-            continue
+            continue sessionLoop
         }
-     }
- 
-    # (no action here, moved logic above)
+    }
 
     # --- Remote Execution Orchestrator -------------------------------------------
     # For options that run on a remote host, this section:
@@ -1238,19 +1191,13 @@ $cred = $Cred
         # Check if the remote machine is online
         if (-not (Test-Connection -ComputerName $hostname -Count 2 -Quiet)) {
             Write-Status -Level ERROR -Message "Host $hostname is offline or unreachable."
-            do {
-                Write-Host "`nWhat would you like to do?"
-                Write-Host "1. Try a different hostname"
-                Write-Host "2. Retry the same hostname"
-                Write-Host "3. Exit to main menu"
-                $offlineChoice = Read-Host "Select an option (1-3)"
-                switch ($offlineChoice) {
-                    '1' { $hostname = $null; continue 2 }
-                    '2' { continue 2 }
-                    '3' { $hostname = $null; continue 1 }
-                    default { Write-Host "Invalid input. Please enter 1, 2, or 3." -ForegroundColor Yellow }
-                }
-            } while ($true)
+            Write-Host "`nWhat would you like to do?"
+            Write-Host "1. Try a different hostname"
+            Write-Host "2. Retry the same hostname"
+            Write-Host "3. Exit to main menu"
+            $offlineChoice = Read-RexieChoice -Prompt "Select an option (1-3)" -ValidChoices '1','2','3'
+            if ($offlineChoice -ne '2') { $hostname = $null }
+            continue sessionLoop
         }
 
         ## Test remote WinRM connectivity with retry if credentials are bad
@@ -1280,7 +1227,6 @@ $cred = $Cred
             } else {
                 $invokeResult = Invoke-Command -ComputerName $hostname -Credential $Cred -ScriptBlock $scriptBlock -ErrorAction Stop
             }
-            $scriptArgs = $null
 
             # If Battery Report (Option 9), open admin share in Finder to C$\HCSTools when possible
             if ($selection -eq '9') {
@@ -1289,17 +1235,33 @@ $cred = $Cred
                 } elseif ($invokeResult -contains '__REPORT_FAILED__') {
                     Write-Host "Battery report generation failed on the remote device." -ForegroundColor Red
                 } else {
-                    # Prefer opening directly to the HCSTools folder on the C$ admin share
-                    $smbPath = "smb://$hostname/C$/HCSTools"
-                    try {
+                    # Start-Process on macOS just hands the URL to Finder and returns
+                    # immediately - it can't detect an async SMB connection failure, so
+                    # check reachability first instead of relying on a try/catch fallback.
+                    if (Test-TcpPort -HostName $hostname -Port 445) {
+                        $smbPath = "smb://$hostname/C$/HCSTools"
                         Write-Status -Level INFO -Message "Opening admin share: $smbPath"
-                        Start-Process $smbPath
-                    } catch {
-                        # Fallback: open the root of C$
-                        $smbRoot = "smb://$hostname/C$"
-                        Write-Status -Level WARN -Message "Could not open HCSTools directly. Opening: $smbRoot"
-                        Start-Process $smbRoot
+                        try {
+                            Start-Process $smbPath
+                        } catch {
+                            Write-Status -Level WARN -Message "Could not launch Finder for $smbPath. Report saved at C:\HCSTools on $hostname."
+                        }
+                    } else {
+                        Write-Status -Level WARN -Message "SMB (port 445) is not reachable on $hostname. Report saved at C:\HCSTools on $hostname - open it manually once reachable."
                     }
+                }
+            }
+
+            # If an immediate reboot/shutdown (Option 5) was triggered, the host is about
+            # to go offline - clear it on shutdown so "Run another task" can't silently
+            # target a machine that's now powered off.
+            if ($selection -eq '5') {
+                if ($invokeResult -contains '__SHUTDOWN_NOW__') {
+                    Write-Status -Level WARN -Message "$hostname was shut down and will not be reachable again until it is powered back on."
+                    $hostname = $null
+                    $justShutDown = $true
+                } elseif ($invokeResult -contains '__REBOOT_NOW__') {
+                    Write-Status -Level WARN -Message "$hostname is rebooting now - it may take a minute or two to come back online."
                 }
             }
         } catch {
@@ -1309,21 +1271,30 @@ $cred = $Cred
 
     # --- Post-Task Prompt ---------------------------------------------------------
     # Lets the operator reuse the same hostname, switch hosts, or exit the session.
+    # Option 6 doesn't target a specific hostname and already has its own "try
+    # another / return to main menu" loop, so it skips straight back here.
     # -----------------------------------------------------------------------------
+    if ($selection -eq '6') {
+        continue sessionLoop
+    }
+
     Write-Status -Level INFO -Message "What would you like to do next?"
-    Write-Host "1. Run another task on this computer"
-    Write-Host "2. Enter a new hostname"
+    if ($justShutDown) {
+        Write-Host "1. Return to main menu"
+    } else {
+        Write-Host "1. Return to main menu (keep hostname: $hostname)"
+    }
+    Write-Host "2. Return to main menu (enter a new hostname)"
     Write-Host "3. Exit"
-    $nextAction = Read-Host "Select an option (1-3)"
+    $nextAction = Read-RexieChoice -Prompt "Select an option (1-3)" -ValidChoices '1','2','3'
     switch ($nextAction) {
         '1' { }  # continue with same hostname
         '2' { $hostname = $null }
         '3' { $repeatSession = $false }
-        default { $repeatSession = $false }
+        $null { }  # cancelled with Q - back out safely, same as "return to main menu", not Exit
     }
     if ($repeatSession -eq $false) {
         $hostname = $null
     }
 } while ($repeatSession)
 #endregion Session Loop & Credential Handling
-        
